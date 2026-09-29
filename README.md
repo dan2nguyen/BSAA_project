@@ -5,15 +5,16 @@ Project dscription
 <img width="1129" height="676" alt="image" src="https://github.com/user-attachments/assets/e342d970-db9f-4e0b-9e9b-57fd63340bd9" />
 
 
-Assignment 1 (DEADLINE: 9.10. 23:59)
-▪ Read biosignal(s) from EDF files. Explore the data with filters, time-frequency transforms, visualizations and collect interesting findings/observations regarding the characteristics of the signal and signal quality.
-▪ Split the data into a training and a test set (e.g. 80/20). Move the test data somewhere separate and don’t touch it until we get to the algorithm validation!
-▪ Try to calculate ground-truth heart rate from ECG using the Pan-Tomkins beat detection algorithm (e.g. “sleepecg” Python package).
-▪ Research scientific literature for existing algorithms and compare your observations with the published information.
-▪ Make a choice for developing an algorithm: Either try to implement an already published algorithm or come up with your own.
-Deliverable (up to 10 points)
-▪ Prepare a short presentation of your results and discuss them with the entire class next week.
-▪ Submit Python code to create visualizations via Moodle until Friday midnight.
+# Assignment 1 (DEADLINE: 9.10. 23:59)
+▪    Read biosignal(s) from EDF files. Explore the data with filters, time-frequency transforms, visualizations and collect interesting findings/observations           regarding the characteristics of the signal and signal quality.<br>
+▪    Split the data into a training and a test set (e.g. 80/20). Move the test data somewhere separate and don’t touch it until we get to the algorithm validation!<br>
+▪    Try to calculate ground-truth heart rate from ECG using the Pan-Tomkins beat detection algorithm (e.g. “sleepecg” Python package).<br>
+▪    Research scientific literature for existing algorithms and compare your observations with the published information.<br>
+▪    Make a choice for developing an algorithm: Either try to implement an already published algorithm or come up with your own.<br>
+
+Deliverable (up to 10 points)<br>
+▪    Prepare a short presentation of your results and discuss them with the entire class next week.<br>
+▪    Submit Python code to create visualizations via Moodle until Friday midnight.<br>
 
 TODO:
 1) Exploratory script (first point)
