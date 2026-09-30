@@ -1,0 +1,21 @@
+[project]
+name = "bsaa-project"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "ngdan", email = "ngdan@seznam.cz" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "mne>=1.13.2",
+    "numpy>=2.5.3",
+]
+
+[project.scripts]
+bsaa-project = "bsaa_project:main"
+
+[build-system]
+requires = ["uv_build>=0.12.21,<0.13.0"]
+build-backend = "uv_build"

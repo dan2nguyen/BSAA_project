@@ -1,7 +1,17 @@
 # BSAA_project
 DREAM TEAM
 
-In order to 
+**This project is managet by UV** <br>
+How to set project enviroment:<br>
+>pip install uv<br>
+
+For venv initialization and updating:
+>uv sync<br>
+
+To add pip library to uv
+> uv add ...
+
+
 
 Project dscription
 <img width="1129" height="676" alt="image" src="https://github.com/user-attachments/assets/e342d970-db9f-4e0b-9e9b-57fd63340bd9" />
