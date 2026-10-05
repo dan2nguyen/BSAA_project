@@ -2,6 +2,9 @@
 __pycache__/
 *.py[codz]
 *$py.class
+task_quality.txt
+tasks.md
+signal_quality_evaluation.json
 
 # C extensions
 *.so
