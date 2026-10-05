@@ -1,7 +1,6 @@
-import os
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy import signal
+
 
 def compute_psd(sig, fs=100.0, nperseg_sec=3.0, noverlap_ratio=0.5):
     """
@@ -140,7 +139,7 @@ def plot_spectrogram(
         extent=extent,
         origin="lower",
         cmap="viridis",
-        interpolation="none"
+        interpolation="none",
     )
     ax.set_title(title)
     ax.set_xlabel("Time [s]")
@@ -150,7 +149,11 @@ def plot_spectrogram(
     fig = ax.get_figure()
     # Only add a colorbar if one doesn't already exist for this axis
     # to prevent colorbar "creep" and layout doubling.
-    if not any(cb.ax.get_shared_xaxes() == ax.get_shared_xaxes() for cb in fig.axes if hasattr(cb, 'colorbar')):
+    if not any(
+        cb.ax.get_shared_xaxes() == ax.get_shared_xaxes()
+        for cb in fig.axes
+        if hasattr(cb, "colorbar")
+    ):
         fig.colorbar(img, ax=ax, label="Power [dB]")
     else:
         # Update the existing colorbar if possible, or just rely on the new image
@@ -161,7 +164,6 @@ def plot_spectrogram(
     # Actually, the most robust way is to check for existing colorbars.
     # But simpler: just remove the colorbar from the per-plot function and
     # add it once. Let's refine this.
-
 
 
 def plot_frequency_char(axes, ecg, ppg, fs=100.0):
@@ -189,8 +191,12 @@ def plot_frequency_char(axes, ecg, ppg, fs=100.0):
         metrics = extract_spectral_metrics(freqs, psd)
 
         # 2. Plotting
-        plot_psd_comparison(axs[0], {label: (freqs, psd)}, title=f"{label} PSD")
-        plot_spectrogram(axs[1], f_s, t_s, sxx, title=f"{label} Spectrogram")
+        plot_psd_comparison(
+            axs[0], {label: (freqs, psd)}, title=f"{label} PSD"
+        )
+        plot_spectrogram(
+            axs[1], f_s, t_s, sxx, title=f"{label} Spectrogram"
+        )
 
         # 3. Print Metrics
         print(f"\n--- {label} Spectral Metrics ---")

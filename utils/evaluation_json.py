@@ -166,7 +166,8 @@ def main():
             if len(parts) < 2:
                 continue
 
-            patient_num, sig_spec = parts[0], parts[1]
+            # Filename format is validated above; the split components are not
+            # needed for processing the EDF signal data itself.
             edf_path = os.path.join(subdir_path, file)
             ecg, ppg, _ = read_edf_signals(edf_path)
 
@@ -179,8 +180,9 @@ def main():
 
             # Windowing
             n_samples = len(ecg)
-            section_id = 0
-            for start in range(0, n_samples - win_size + 1, step_size):
+            for section_id, start in enumerate(
+                range(0, n_samples - win_size + 1, step_size)
+            ):
                 end = start + win_size
                 ecg_slice = ecg[start:end]
                 ppg_slice = ppg[start:end]
@@ -193,7 +195,6 @@ def main():
                     "ecg": ecg_metrics,
                     "ppg": ppg_metrics,
                 }
-                section_id += 1
 
             # Now save the JSON file for this EDF (prevents corruption on interruption)
             json_filename = file.replace(".edf", ".json")
