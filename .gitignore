@@ -2,6 +2,7 @@
 __pycache__/
 *.py[codz]
 *$py.class
+*smirak.py
 task_quality.txt
 tasks.md
 signal_quality_evaluation.json
@@ -222,3 +223,4 @@ __marimo__/
 
 # Data folder
 harmonized_ecg_ppg_databases
+evaluation_results
