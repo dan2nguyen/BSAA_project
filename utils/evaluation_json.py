@@ -1,3 +1,4 @@
+import csv
 import itertools
 import json
 import os
@@ -96,8 +97,8 @@ def compute_metrics(x, fs, signal_type):
     }
 
 
-def save_json(data, filename="signal_quality_evaluation.json"):
-    with open(filename, "w") as f:
+def save_json(data, filepath):
+    with open(filepath, "w") as f:
         json.dump(data, f, indent=2)
 
 
@@ -112,31 +113,22 @@ def main():
         print("No folder selected. Exiting.")
         return
 
-    json_filename = "signal_quality_evaluation.json"
+    # Define output directory
+    output_root = "evaluation_results"
+    if not os.path.exists(output_root):
+        os.makedirs(output_root)
 
-    # Load existing data or initialize
-    if os.path.exists(json_filename):
-        with open(json_filename, "r") as f:
-            output_data = json.load(f)
-        print("Loaded existing progress from JSON.")
-    else:
-        output_data = {
-            "base_folder_name": os.path.basename(base_folder),
-            "checkpoint": {
-                "last_processed_file": None,
-                "last_processed_subdir": None,
-            },
-            "subfolders": {},
-        }
-        save_json(output_data, json_filename)
-        print("Initialized new evaluation JSON.")
+    progress_csv = os.path.join(output_root, "processed_files.csv")
 
-    # Ensure checkpoint exists in the data
-    if "checkpoint" not in output_data:
-        output_data["checkpoint"] = {
-            "last_processed_file": None,
-            "last_processed_subdir": None,
-        }
+    # Load processed files for interruption handling
+    processed_files = set()
+    if os.path.exists(progress_csv):
+        with open(progress_csv, "r", newline="") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if row:
+                    processed_files.add(row[0])
+        print(f"Loaded {len(processed_files)} already processed files.")
 
     fs = 100
     win_size = 1000
@@ -150,32 +142,24 @@ def main():
         ]
     )
 
-    checkpoint = output_data["checkpoint"]
-    last_file = checkpoint["last_processed_file"]
-    last_subdir = checkpoint["last_processed_subdir"]
-
-    # State to track if we should skip files to reach the checkpoint
-    should_skip = True
-    if last_file is None:
-        should_skip = False
-
-    for subdir_name in subdirs[:3]:
+    for subdir_name in subdirs:
         subdir_path = os.path.join(base_folder, subdir_name)
-        if subdir_name not in output_data["subfolders"]:
-            output_data["subfolders"][subdir_name] = {}
+
+        # Create corresponding output folder
+        output_subdir = os.path.join(output_root, subdir_name)
+        if not os.path.exists(output_subdir):
+            os.makedirs(output_subdir)
 
         files = sorted(
             [f for f in os.listdir(subdir_path) if f.endswith(".edf")]
         )
 
         for file in files:
-            # Checkpoint Logic
-            if should_skip:
-                if subdir_name == last_subdir and file == last_file:
-                    should_skip = False
-                    print(f"Reached checkpoint: {file}. Resuming...")
-                else:
-                    continue
+            # Relative path for tracking in CSV
+            rel_path = os.path.join(subdir_name, file)
+
+            if rel_path in processed_files:
+                continue
 
             print(f"Processing: {file}")
             parts = file.replace(".edf", "").split("_", 1)
@@ -190,21 +174,8 @@ def main():
                 print(f"Skipping {file}: Missing signal data")
                 continue
 
-            # Ensure nested structure exists
-            if (
-                patient_num
-                not in output_data["subfolders"][subdir_name]
-            ):
-                output_data["subfolders"][subdir_name][patient_num] = {}
-            if (
-                sig_spec
-                not in output_data["subfolders"][subdir_name][
-                    patient_num
-                ]
-            ):
-                output_data["subfolders"][subdir_name][patient_num][
-                    sig_spec
-                ] = {}
+            # Store results for THIS specific file in memory first
+            file_data = {}
 
             # Windowing
             n_samples = len(ecg)
@@ -217,25 +188,24 @@ def main():
                 ecg_metrics = compute_metrics(ecg_slice, fs, "ecg")
                 ppg_metrics = compute_metrics(ppg_slice, fs, "ppg")
 
-                output_data["subfolders"][subdir_name][patient_num][
-                    sig_spec
-                ][str(section_id)] = {
+                file_data[str(section_id)] = {
                     "indexing": [start, end],
                     "ecg": ecg_metrics,
                     "ppg": ppg_metrics,
                 }
-                section_id += 1  # noqa: SIM113
+                section_id += 1
 
-            # Update Checkpoint and Save Incremental
-            output_data["checkpoint"]["last_processed_file"] = file
-            output_data["checkpoint"]["last_processed_subdir"] = (
-                subdir_name
-            )
-            save_json(output_data, json_filename)
+            # Now save the JSON file for this EDF (prevents corruption on interruption)
+            json_filename = file.replace(".edf", ".json")
+            json_path = os.path.join(output_subdir, json_filename)
+            save_json(file_data, json_path)
 
-    print(
-        "Evaluation complete. Results saved to signal_quality_evaluation.json"
-    )
+            # Update progress CSV immediately after successful save
+            with open(progress_csv, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([rel_path])
+
+    print(f"Evaluation complete. Results saved to {output_root}")
 
 
 if __name__ == "__main__":
