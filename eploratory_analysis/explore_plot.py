@@ -1,16 +1,21 @@
 import argparse
 import os
 import random
+import sys
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog
 
 import matplotlib.pyplot as plt
 import numpy as np
+from filters import apply_standard_filters
 from matplotlib.widgets import Button, TextBox
+from time_frequency import plot_frequency_char
 
-from utils.filters import apply_standard_filters
+root_dir = Path(__file__).resolve().parent.parent
+sys.path.append(str(root_dir))
+
 from utils.read_edf import read_edf_signals
-from utils.time_frequency import plot_frequency_char
 
 
 class EDFExplorer:
@@ -219,7 +224,7 @@ def get_specific_edf_file():
         title="Select an EDF file",
         filetypes=[("EDF files", "*.edf")],
         initialdir=os.path.join(
-            os.getcwd(), "harmonized_ecg_ppg_databases"
+            os.getcwd(), "data", "harmonized_ecg_ppg_databases"
         ),
     )
     root.destroy()
@@ -243,7 +248,7 @@ if __name__ == "__main__":
         else:
             print("No EDF file was selected.")
     else:
-        data_folder = "harmonized_ecg_ppg_databases"
+        data_folder = r"data/harmonized_ecg_ppg_database_filtered"
         all_edf_files = []
         for root, _, files in os.walk(data_folder):
             for file in files:

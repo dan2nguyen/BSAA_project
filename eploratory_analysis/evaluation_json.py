@@ -2,14 +2,20 @@ import csv
 import itertools
 import json
 import os
+import sys
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog
 
 import numpy as np
 import scipy.integrate
 import scipy.signal
 import scipy.stats
-from read_edf import read_edf_signals
+
+root_dir = Path(__file__).resolve().parent.parent
+sys.path.append(str(root_dir))
+
+from utils.read_edf import read_edf_signals
 
 
 def compute_metrics(x, fs, signal_type):
@@ -104,17 +110,31 @@ def save_json(data, filepath):
 
 def main():
     # 1. Base Folder Selection
-    root_tk = tk.Tk()
-    root_tk.withdraw()
-    base_folder = filedialog.askdirectory(
-        title="Select Base Database Folder"
-    )
-    if not base_folder:
-        print("No folder selected. Exiting.")
-        return
+    # Check if base folder is provided as a terminal argument
+    if len(sys.argv) > 1:
+        base_folder = sys.argv[1]
+        if not os.path.isdir(base_folder):
+            print(
+                f"Error: The provided path '{base_folder}' is not a valid directory."
+            )
+            sys.exit(1)
+    else:
+        # Fallback to GUI if no argument is provided
+        root_tk = tk.Tk()
+        root_tk.withdraw()
+        base_folder = filedialog.askdirectory(
+            title="Select Base Database Folder"
+        )
+        if not base_folder:
+            print("No folder selected. Exiting.")
+            return
 
     # Define output directory
-    output_root = "evaluation_results"
+    if len(sys.argv) > 2:
+        output_root = sys.argv[2]
+    else:
+        output_root = r"data\evaluation_results_filt"
+
     if not os.path.exists(output_root):
         os.makedirs(output_root)
 

@@ -222,5 +222,5 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Data folder
-harmonized_ecg_ppg_databases
-evaluation_results
+data
+planning
