@@ -1,4 +1,5 @@
 import numpy as np
+import scipy.signal
 from sleepecg import detect_heartbeats
 
 
@@ -57,3 +58,47 @@ def detect_qrs(
     if not peaks:
         return np.array([], dtype=int)
     return np.concatenate(peaks).astype(int)
+
+
+def pan_tompkins_stages(
+    ecg: np.ndarray,
+    fs: float,
+    band_hz: tuple[float, float] = (5.0, 15.0),
+    window_s: float = 0.15,
+) -> dict:
+    """
+    Computes the intermediate signals of the classic Pan-Tompkins
+    preprocessing chain. For illustration only (slides): the actual
+    detection in `detect_qrs` is done by sleepecg, which uses a 5-30 Hz
+    bandpass and its own implementation of these stages.
+
+    Args:
+        ecg (np.ndarray): 1D ECG signal.
+        fs (float): Sampling rate in Hz.
+        band_hz (tuple): Bandpass cutoff frequencies in Hz.
+        window_s (float): Length of the moving integration window in seconds.
+
+    Returns:
+        dict: Arrays of the same length as `ecg` under the keys
+            input, bandpass, derivative, squared, integrated.
+    """
+    ecg = np.asarray(ecg, dtype=float)
+    sos = scipy.signal.butter(2, band_hz, btype="bandpass", fs=fs, output="sos")
+    bandpass = scipy.signal.sosfiltfilt(sos, ecg)
+
+    # Five-point derivative from the original paper, centered (no delay)
+    kernel = np.array([2.0, 1.0, 0.0, -1.0, -2.0]) * fs / 8.0
+    derivative = np.convolve(bandpass, kernel, mode="same")
+
+    squared = derivative**2
+
+    window = max(int(round(window_s * fs)), 1)
+    integrated = np.convolve(squared, np.ones(window) / window, mode="same")
+
+    return {
+        "input": ecg,
+        "bandpass": bandpass,
+        "derivative": derivative,
+        "squared": squared,
+        "integrated": integrated,
+    }

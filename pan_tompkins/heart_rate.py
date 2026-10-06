@@ -14,6 +14,7 @@ from utils.read_edf import read_edf_signals
 
 MIN_BEATS = 3
 HR_RANGE_BPM = (30.0, 220.0)
+MAX_RR_CV = 0.15
 
 
 def compute_hr_segments(
@@ -24,13 +25,19 @@ def compute_hr_segments(
     step_s: float | None = None,
     min_beats: int = MIN_BEATS,
     hr_range_bpm: tuple[float, float] = HR_RANGE_BPM,
+    max_rr_cv: float = MAX_RR_CV,
 ) -> pd.DataFrame:
     """
     Computes heart rate in fixed-length segments from detected QRS peaks.
 
     Only RR intervals lying completely inside a segment are used. The last
-    incomplete segment of the recording is skipped. Segments with too few
-    beats or with HR outside `hr_range_bpm` get NaN in all HR/RR columns.
+    incomplete segment of the recording is skipped.
+
+    A segment is invalid (HR = NaN) when it has too few beats, HR outside
+    `hr_range_bpm` or too irregular RR intervals (rr_cv > `max_rr_cv`,
+    typical for artifacts and missed/double beats). The RR statistics and
+    rr_cv are kept for every segment with enough beats, so the thresholds
+    can be changed later without running the detection again.
 
     Args:
         peaks (np.ndarray): Sorted sample indices of the QRS peaks.
@@ -41,12 +48,14 @@ def compute_hr_segments(
             Defaults to `segment_s` (no overlap).
         min_beats (int): Minimum number of beats in a segment to compute HR.
         hr_range_bpm (tuple): Accepted (min, max) HR in bpm.
+        max_rr_cv (float): Maximum accepted rr_std_s / rr_mean_s.
 
     Returns:
         pd.DataFrame: One row per segment with columns
             start, end (samples), start_s, end_s, segment_s, n_beats,
             hr_bpm (from mean RR), hr_median_bpm (from median RR),
-            rr_mean_s, rr_median_s, rr_std_s, valid, invalid_reason.
+            rr_mean_s, rr_median_s, rr_std_s, rr_cv (rr_std_s / rr_mean_s),
+            valid, invalid_reason.
     """
     if step_s is None:
         step_s = segment_s
@@ -75,6 +84,7 @@ def compute_hr_segments(
             "rr_mean_s": np.nan,
             "rr_median_s": np.nan,
             "rr_std_s": np.nan,
+            "rr_cv": np.nan,
             "valid": False,
             "invalid_reason": "",
         }
@@ -84,18 +94,20 @@ def compute_hr_segments(
             continue
 
         rr = np.diff(peaks[i:j]) / fs
-        hr = 60.0 / np.mean(rr)
-        if not hr_range_bpm[0] <= hr <= hr_range_bpm[1]:
-            row["invalid_reason"] = "hr_out_of_range"
-            rows.append(row)
-            continue
-
-        row["hr_bpm"] = float(hr)
-        row["hr_median_bpm"] = float(60.0 / np.median(rr))
         row["rr_mean_s"] = float(np.mean(rr))
         row["rr_median_s"] = float(np.median(rr))
         row["rr_std_s"] = float(np.std(rr))
-        row["valid"] = True
+        row["rr_cv"] = row["rr_std_s"] / row["rr_mean_s"]
+
+        hr = 60.0 / row["rr_mean_s"]
+        if not hr_range_bpm[0] <= hr <= hr_range_bpm[1]:
+            row["invalid_reason"] = "hr_out_of_range"
+        elif row["rr_cv"] > max_rr_cv:
+            row["invalid_reason"] = "irregular_rr"
+        else:
+            row["hr_bpm"] = float(hr)
+            row["hr_median_bpm"] = float(60.0 / row["rr_median_s"])
+            row["valid"] = True
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -111,9 +123,9 @@ def estimate_hr(
     Runs the whole pipeline on one ECG signal: QRS detection, segment-wise
     HR and the segment quality check.
 
-    Segments failing the quality check get NaN in all HR/RR columns and
-    the quality reason in `invalid_reason` (it has priority over the
-    beat-based reasons from `compute_hr_segments`).
+    Segments failing the quality check get NaN in all HR/RR columns
+    (including rr_cv) and the quality reason in `invalid_reason` (it has
+    priority over the beat-based reasons from `compute_hr_segments`).
 
     Args:
         ecg (np.ndarray): 1D ECG signal (already filtered).
@@ -135,6 +147,7 @@ def estimate_hr(
         "rr_mean_s",
         "rr_median_s",
         "rr_std_s",
+        "rr_cv",
     ]
     for idx, start, end in zip(hr.index, hr["start"], hr["end"]):
         ok, reason = check_segment_quality(ecg[start:end])
