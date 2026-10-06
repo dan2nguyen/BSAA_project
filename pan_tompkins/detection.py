@@ -113,3 +113,55 @@ def pan_tompkins_stages(
         "squared": squared,
         "integrated": integrated,
     }
+
+
+def pan_tompkins_threshold(
+    integrated: np.ndarray,
+    fs: float,
+    refractory_s: float = 0.2,
+    learning_s: float = 2.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Applies the classic Pan-Tompkins adaptive threshold to the integrated
+    signal. For illustration only (slides): `detect_qrs` uses the sleepecg
+    implementation, which additionally has a searchback and a second
+    threshold on the filtered signal.
+
+    The threshold is NPKI + 0.25 * (SPKI - NPKI), where SPKI and NPKI are
+    running estimates of the signal and noise peak levels.
+
+    Args:
+        integrated (np.ndarray): Output of the moving window integration.
+        fs (float): Sampling rate in Hz.
+        refractory_s (float): Minimum distance between peak candidates.
+        learning_s (float): Initial part used to initialize SPKI and NPKI.
+
+    Returns:
+        tuple: (threshold, peaks)
+            - threshold: threshold value for every sample of `integrated`
+            - peaks: sample indices of the candidates above the threshold
+    """
+    integrated = np.asarray(integrated, dtype=float)
+    candidates, _ = scipy.signal.find_peaks(
+        integrated, distance=max(int(round(refractory_s * fs)), 1)
+    )
+    learning = integrated[: max(int(round(learning_s * fs)), 1)]
+    spki = np.max(learning)
+    npki = 0.5 * np.mean(learning)
+    current = npki + 0.25 * (spki - npki)
+
+    threshold = np.empty(len(integrated))
+    peaks = []
+    last = 0
+    for candidate in candidates:
+        threshold[last:candidate] = current
+        value = integrated[candidate]
+        if value > current:
+            spki = 0.125 * value + 0.875 * spki
+            peaks.append(candidate)
+        else:
+            npki = 0.125 * value + 0.875 * npki
+        current = npki + 0.25 * (spki - npki)
+        last = candidate
+    threshold[last:] = current
+    return threshold, np.array(peaks, dtype=int)
