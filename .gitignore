@@ -226,3 +226,5 @@ data
 planning
 .DS_Store
 utils/harmonize*/
+CLAUDE.md
+.claude/

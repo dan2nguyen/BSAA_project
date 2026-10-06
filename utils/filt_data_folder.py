@@ -11,7 +11,7 @@ import numpy as np
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
-from eploratory_analysis.filters import apply_standard_filters
+from exploratory_analysis.filters import apply_standard_filters
 from utils.read_edf import read_edf_signals
 
 
