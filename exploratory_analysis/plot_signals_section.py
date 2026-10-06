@@ -1,5 +1,4 @@
 import argparse
-import json
 import os
 import random
 import sys
@@ -9,6 +8,7 @@ from tkinter import filedialog
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 from matplotlib.widgets import Button
 
 root_dir = Path(__file__).resolve().parent.parent
@@ -17,45 +17,51 @@ sys.path.append(str(root_dir))
 from utils.read_edf import read_edf_signals
 
 
-def load_all_sections(eval_root="evaluation_results"):
-    """Scans the evaluation directory and flattens all sections into a list."""
-    sections = []
+def load_all_sections(eval_root=r"data\evaluation_results.parquet"):
+    """Loads evaluation results from a Parquet file and flattens them."""
     if not os.path.exists(eval_root):
-        print(f"Evaluation root {eval_root} not found.")
-        return sections
+        print(f"Evaluation file {eval_root} not found.")
+        return []
 
-    for root, dirs, files in os.walk(eval_root):
-        for file in files:
-            if file.endswith(".json"):
-                json_path = os.path.join(root, file)
-                try:
-                    with open(json_path, "r") as f:
-                        data = json.load(f)
+    try:
+        df = pd.read_parquet(eval_root)
+        # We need to group by section to get both ECG and PPG metrics for the visualizer
+        # as the original JSON structure had: section_id -> {ecg: ..., ppg: ...}
+        sections = []
 
-                    # Determine relative path from eval_root
-                    rel_json_path = os.path.relpath(
-                        json_path, eval_root
-                    )
+        # Grouping by the unique identifier of a section: base_folder, edf_filename, section_id
+        grouped = df.groupby(["base_folder", "edf_filename", "section_id"])
 
-                    # The JSON file is named after the EDF.
-                    # We need the original EDF file.
-                    # Assuming the base database folder is passed to SignalVisualizer.
-                    # We store the metadata needed to find the EDF.
-                    for section_id, info in data.items():
-                        sections.append(
-                            {
-                                "rel_json_path": rel_json_path,
-                                "section_id": section_id,
-                                "indexing": info["indexing"],
-                                "ecg_metrics": info["ecg"],
-                                "ppg_metrics": info["ppg"],
-                                "edf_filename": file.replace(
-                                    ".json", ".edf"
-                                ),
-                            }
-                        )
-                except Exception as e:  # noqa: BLE001
-                    print(f"Error loading {json_path}: {e}")
+        for (base_folder, edf_filename, section_id), group in grouped:
+            # Extract metrics for each signal type
+            ecg_row = group[group["signal_type"] == "ecg"]
+            ppg_row = group[group["signal_type"] == "ppg"]
+
+            if ecg_row.empty or ppg_row.empty:
+                continue
+
+            ecg_data = ecg_row.iloc[0].to_dict()
+            ppg_data = ppg_row.iloc[0].to_dict()
+
+            # Remove the metadata columns from the metrics dictionaries
+            meta_cols = ["base_folder", "edf_filename", "section_id", "start", "end", "signal_type"]
+            ecg_metrics = {k: v for k, v in ecg_data.items() if k not in meta_cols}
+            ppg_metrics = {k: v for k, v in ppg_data.items() if k not in meta_cols}
+
+            sections.append(
+                {
+                    "rel_json_path": os.path.join(base_folder, edf_filename),
+                    "section_id": str(section_id),
+                    "indexing": [ecg_data["start"], ecg_data["end"]],
+                    "ecg_metrics": ecg_metrics,
+                    "ppg_metrics": ppg_metrics,
+                    "edf_filename": edf_filename,
+                }
+            )
+    except Exception as e:
+        print(f"Error loading Parquet file {eval_root}: {e}")
+        return []
+
     return sections
 
 
@@ -256,9 +262,9 @@ def main():
         return
 
     # 2. Load all sections from the new structure
-    sections = load_all_sections(r"data\evaluation_results_filt")
+    sections = load_all_sections(r"data\evaluation_results.parquet")
     if not sections:
-        print("No evaluation sections found in 'evaluation_results'.")
+        print("No evaluation sections found in 'data\\evaluation_results.parquet'.")
         return
 
     # 3. Handle Specific Mode Configuration

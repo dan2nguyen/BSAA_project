@@ -1,6 +1,5 @@
 import csv
 import itertools
-import json
 import os
 import sys
 import tkinter as tk
@@ -8,6 +7,7 @@ from pathlib import Path
 from tkinter import filedialog
 
 import numpy as np
+import pandas as pd
 import scipy.integrate
 import scipy.signal
 import scipy.stats
@@ -103,11 +103,6 @@ def compute_metrics(x, fs, signal_type):
     }
 
 
-def save_json(data, filepath):
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=2)
-
-
 def main():
     # 1. Base Folder Selection
     # Check if base folder is provided as a terminal argument
@@ -129,16 +124,20 @@ def main():
             print("No folder selected. Exiting.")
             return
 
-    # Define output directory
+    # Define output file
     if len(sys.argv) > 2:
-        output_root = sys.argv[2]
+        output_file = sys.argv[2]
     else:
-        output_root = r"data\evaluation_results_filt"
+        output_file = r"data\evaluation_results.parquet"
 
-    if not os.path.exists(output_root):
-        os.makedirs(output_root)
+    # Ensure output directory exists
+    output_dir = os.path.dirname(output_file)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
-    progress_csv = os.path.join(output_root, "processed_files.csv")
+    progress_csv = os.path.join(
+        output_dir if output_dir else ".", "processed_files.csv"
+    )
 
     # Load processed files for interruption handling
     processed_files = set()
@@ -162,13 +161,11 @@ def main():
         ]
     )
 
+    all_results = []
+
     for subdir_name in subdirs:
         subdir_path = os.path.join(base_folder, subdir_name)
-
-        # Create corresponding output folder
-        output_subdir = os.path.join(output_root, subdir_name)
-        if not os.path.exists(output_subdir):
-            os.makedirs(output_subdir)
+        print(f"\n--- Processing directory: {subdir_name} ---")
 
         files = sorted(
             [f for f in os.listdir(subdir_path) if f.endswith(".edf")]
@@ -181,22 +178,17 @@ def main():
             if rel_path in processed_files:
                 continue
 
-            print(f"Processing: {file}")
+            print(f"Processing file: {file}")
             parts = file.replace(".edf", "").split("_", 1)
             if len(parts) < 2:
                 continue
 
-            # Filename format is validated above; the split components are not
-            # needed for processing the EDF signal data itself.
             edf_path = os.path.join(subdir_path, file)
             ecg, ppg, _ = read_edf_signals(edf_path)
 
             if ecg is None or ppg is None:
                 print(f"Skipping {file}: Missing signal data")
                 continue
-
-            # Store results for THIS specific file in memory first
-            file_data = {}
 
             # Windowing
             n_samples = len(ecg)
@@ -210,23 +202,37 @@ def main():
                 ecg_metrics = compute_metrics(ecg_slice, fs, "ecg")
                 ppg_metrics = compute_metrics(ppg_slice, fs, "ppg")
 
-                file_data[str(section_id)] = {
-                    "indexing": [start, end],
-                    "ecg": ecg_metrics,
-                    "ppg": ppg_metrics,
+                # We flatten metrics into rows. One row per signal type per section.
+                # Common metadata:
+                common_meta = {
+                    "base_folder": subdir_name,
+                    "edf_filename": file,
+                    "section_id": section_id,
+                    "start": start,
+                    "end": end,
                 }
 
-            # Now save the JSON file for this EDF (prevents corruption on interruption)
-            json_filename = file.replace(".edf", ".json")
-            json_path = os.path.join(output_subdir, json_filename)
-            save_json(file_data, json_path)
+                # ECG row
+                ecg_row = common_meta.copy()
+                ecg_row.update({"signal_type": "ecg", **ecg_metrics})
+                all_results.append(ecg_row)
 
-            # Update progress CSV immediately after successful save
+                # PPG row
+                ppg_row = common_meta.copy()
+                ppg_row.update({"signal_type": "ppg", **ppg_metrics})
+                all_results.append(ppg_row)
+
+            # Update progress CSV immediately after successful processing
             with open(progress_csv, "a", newline="") as f:
                 writer = csv.writer(f)
                 writer.writerow([rel_path])
 
-    print(f"Evaluation complete. Results saved to {output_root}")
+    if all_results:
+        df = pd.DataFrame(all_results)
+        df.to_parquet(output_file, index=False, compression="snappy")
+        print(f"Evaluation complete. Results saved to {output_file}")
+    else:
+        print("No results to save.")
 
 
 if __name__ == "__main__":
