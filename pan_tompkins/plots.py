@@ -153,6 +153,7 @@ def plot_hr_curve(
     start_s: float | None = None,
     end_s: float | None = None,
     title: str = "",
+    min_y_range_bpm: float = 30.0,
 ):
     """
     Plots HR over time, one point per segment. Invalid segments (HR = NaN)
@@ -163,6 +164,8 @@ def plot_hr_curve(
         start_s (float, optional): Start of the plotted range in seconds.
         end_s (float, optional): End of the plotted range in seconds.
         title (str): Figure title.
+        min_y_range_bpm (float): Minimum span of the y axis in bpm, so
+            small HR fluctuations are not visually exaggerated.
 
     Returns:
         matplotlib.figure.Figure: The created figure.
@@ -187,6 +190,13 @@ def plot_hr_curve(
     if len(hr):
         ax.set_xlim(hr["start_s"].iloc[0], hr["end_s"].iloc[-1])
     ax.set_xlabel("Time (s)")
+    y_low, y_high = ax.get_ylim()
+    if y_high - y_low < min_y_range_bpm:
+        y_center = (y_low + y_high) / 2.0
+        ax.set_ylim(
+            y_center - min_y_range_bpm / 2.0,
+            y_center + min_y_range_bpm / 2.0,
+        )
     ax.set_ylabel("Heart rate (bpm)")
     ax.set_title(title, color=TEXT_COLOR, fontsize=12, loc="left")
     _add_legend(ax)

@@ -16,6 +16,26 @@ MIN_BEATS = 3
 HR_RANGE_BPM = (30.0, 220.0)
 MAX_RR_CV = 0.15
 
+HR_COLUMNS = [
+    "hr_bpm",
+    "hr_median_bpm",
+    "rr_mean_s",
+    "rr_median_s",
+    "rr_std_s",
+    "rr_cv",
+]
+SEGMENT_COLUMNS = [
+    "start",
+    "end",
+    "start_s",
+    "end_s",
+    "segment_s",
+    "n_beats",
+    *HR_COLUMNS,
+    "valid",
+    "invalid_reason",
+]
+
 
 def compute_hr_segments(
     peaks: np.ndarray,
@@ -110,7 +130,9 @@ def compute_hr_segments(
             row["valid"] = True
         rows.append(row)
 
-    return pd.DataFrame(rows)
+    # Explicit columns keep the layout also for recordings shorter than
+    # one segment (no rows)
+    return pd.DataFrame(rows, columns=SEGMENT_COLUMNS)
 
 
 def estimate_hr(
@@ -141,20 +163,18 @@ def estimate_hr(
     peaks = detect_qrs(ecg, fs)
     hr = compute_hr_segments(peaks, len(ecg), fs, segment_s, step_s)
 
-    hr_columns = [
-        "hr_bpm",
-        "hr_median_bpm",
-        "rr_mean_s",
-        "rr_median_s",
-        "rr_std_s",
-        "rr_cv",
+    if hr.empty:
+        return hr, peaks
+
+    checks = [
+        check_segment_quality(ecg[start:end])
+        for start, end in zip(hr["start"], hr["end"])
     ]
-    for idx, start, end in zip(hr.index, hr["start"], hr["end"]):
-        ok, reason = check_segment_quality(ecg[start:end])
-        if not ok:
-            hr.loc[idx, hr_columns] = np.nan
-            hr.loc[idx, "valid"] = False
-            hr.loc[idx, "invalid_reason"] = reason
+    bad = np.array([not ok for ok, _ in checks])
+    reasons = np.array([reason for _, reason in checks], dtype=object)
+    hr.loc[bad, HR_COLUMNS] = np.nan
+    hr.loc[bad, "valid"] = False
+    hr.loc[bad, "invalid_reason"] = reasons[bad]
     return hr, peaks
 
 

@@ -8,6 +8,7 @@ def detect_qrs(
     fs: float,
     chunk_s: float = 300.0,
     overlap_s: float = 10.0,
+    max_flat_fraction: float = 0.99,
 ) -> np.ndarray:
     """
     Detects QRS peaks in an ECG signal with the Pan-Tompkins algorithm.
@@ -22,11 +23,19 @@ def detect_qrs(
     additional filtering is done here apart from the internal stages of
     the detector.
 
+    Chunks that are dead (almost all consecutive samples identical) are
+    skipped: there are no beats to find and the searchback of the detector
+    gets extremely slow on such data. With the default threshold a skipped
+    chunk has only a few seconds of changing signal, so its segments are
+    rejected by the quality check anyway.
+
     Args:
         ecg (np.ndarray): 1D ECG signal.
         fs (float): Sampling rate in Hz.
         chunk_s (float): Length of the chunk core in seconds.
         overlap_s (float): Extension of the chunk on each side in seconds.
+        max_flat_fraction (float): Chunks with a higher share of
+            zero-derivative samples are skipped.
 
     Returns:
         np.ndarray: Sorted sample indices of the detected QRS peaks.
@@ -48,6 +57,8 @@ def detect_qrs(
         std = np.std(x)
         # Constant or broken chunk, nothing to detect
         if not np.isfinite(std) or std == 0:
+            continue
+        if np.mean(np.diff(x) == 0) > max_flat_fraction:
             continue
 
         z = (x - np.mean(x)) / std
