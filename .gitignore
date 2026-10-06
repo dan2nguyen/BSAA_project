@@ -224,3 +224,5 @@ __marimo__/
 # Data folder
 data
 planning
+.DS_Store
+utils/harmonize*/
