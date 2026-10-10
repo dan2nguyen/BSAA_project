@@ -248,7 +248,7 @@ if __name__ == "__main__":
         else:
             print("No EDF file was selected.")
     else:
-        data_folder = r"data/harmonized_ecg_ppg_database_filtered"
+        data_folder = r"data/harmonized_ecg_ppg_databases"
         all_edf_files = []
         for root, _, files in os.walk(data_folder):
             for file in files:

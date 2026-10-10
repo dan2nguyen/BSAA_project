@@ -80,7 +80,7 @@ if __name__ == "__main__":
     # Define filter parameters
     params = {
         "ECG Bandpass": (0.5, 40.0, "band"),
-        "PPG Bandpass": (0.5, 5.0, "band"),
+        "PPG Bandpass": (0.5, 8.0, "band"),
         "ECG Notch": (50.0, "notch"),
     }
 

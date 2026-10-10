@@ -3,11 +3,14 @@ import itertools
 import os
 import sys
 import tkinter as tk
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from tkinter import filedialog
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import scipy.integrate
 import scipy.signal
 import scipy.stats
@@ -66,23 +69,23 @@ def compute_metrics(x, fs, signal_type):
     kurt = float(scipy.stats.kurtosis(x, fisher=False))
     skew = float(scipy.stats.skew(x))
 
-    std_flat = len([v for v in std_piecewise if v < 1e-4]) >= 3
+    std_flat = len([v for v in std_piecewise if v < 1e-6]) >= 3
     zero_dev_flat = zero_dev_dur > 4.0
-    dynamic_range_flat = dynamic_range < 1.0
     mean_abs_der_spike = mean_abs_der > (2.0 * std)
     lf_ratio_motion = lf_ratio > 0.6
 
     if signal_type == "ecg":
+        dynamic_range_flat = dynamic_range < 1e-5
         inband_out = inband_ratio < 0.40
         kurtosis_out = kurt < 5.0 or kurt > 30.0
         skewness_out = abs(skew) < 0.2
     else:  # ppg
+        dynamic_range_flat = dynamic_range < 1
         inband_out = inband_ratio < 0.50
         kurtosis_out = kurt < 2.0 or kurt > 10.0
         skewness_out = skew < 0.0
 
     return {
-        "signal_type": signal_type,
         "std": std,
         "std_piecewise": std_piecewise,
         "zero_dev_dur": zero_dev_dur,
@@ -93,7 +96,7 @@ def compute_metrics(x, fs, signal_type):
         "kurtosis": kurt,
         "Skewness": skew,
         "std_flat": std_flat,
-        "zero_dev_flat": zero_dev_flat,
+        "zero_dev_flat": zero_dev_dur > 4.0,  # redundancy
         "dynamic_range_flat": dynamic_range_flat,
         "mean_absolute_derivative_spike": mean_abs_der_spike,
         "LF_ratio_motion": lf_ratio_motion,
@@ -103,9 +106,55 @@ def compute_metrics(x, fs, signal_type):
     }
 
 
+def process_single_edf(task_info):
+    """Worker function to process one EDF file."""
+    base_folder, subdir_name, file, fs, win_size, step_size = task_info
+
+    rel_path = os.path.join(subdir_name, file)
+    try:
+        edf_path = os.path.join(base_folder, subdir_name, file)
+        ecg, ppg, _ = read_edf_signals(edf_path)
+
+        if ecg is None or ppg is None:
+            return None, rel_path
+
+        file_results = []
+        n_samples = len(ecg)
+        for section_id, start in enumerate(
+            range(0, n_samples - win_size + 1, step_size)
+        ):
+            end = start + win_size
+            ecg_slice = ecg[start:end]
+            ppg_slice = ppg[start:end]
+
+            ecg_metrics = compute_metrics(ecg_slice, fs, "ecg")
+            ppg_metrics = compute_metrics(ppg_slice, fs, "ppg")
+
+            # WIDE FORMAT: One row per section containing both ECG and PPG
+            row = {
+                "base_folder": subdir_name,
+                "edf_filename": file,
+                "section_id": section_id,
+                "start": start,
+                "end": end,
+            }
+
+            # Prefix metrics to avoid collisions
+            for k, v in ecg_metrics.items():
+                row[f"ecg_{k}"] = v
+            for k, v in ppg_metrics.items():
+                row[f"ppg_{k}"] = v
+
+            file_results.append(row)
+
+        return file_results, rel_path
+    except Exception as e:
+        print(f"Error processing {file}: {e}")
+        return None, rel_path
+
+
 def main():
     # 1. Base Folder Selection
-    # Check if base folder is provided as a terminal argument
     if len(sys.argv) > 1:
         base_folder = sys.argv[1]
         if not os.path.isdir(base_folder):
@@ -114,7 +163,6 @@ def main():
             )
             sys.exit(1)
     else:
-        # Fallback to GUI if no argument is provided
         root_tk = tk.Tk()
         root_tk.withdraw()
         base_folder = filedialog.askdirectory(
@@ -128,9 +176,8 @@ def main():
     if len(sys.argv) > 2:
         output_file = sys.argv[2]
     else:
-        output_file = r"data\evaluation_results.parquet"
+        output_file = r"references\evaluation_results.parquet"
 
-    # Ensure output directory exists
     output_dir = os.path.dirname(output_file)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -139,7 +186,6 @@ def main():
         output_dir if output_dir else ".", "processed_files.csv"
     )
 
-    # Load processed files for interruption handling
     processed_files = set()
     if os.path.exists(progress_csv):
         with open(progress_csv, "r", newline="") as f:
@@ -153,6 +199,8 @@ def main():
     win_size = 1000
     step_size = 500
 
+    # Collect all tasks
+    tasks = []
     subdirs = sorted(
         [
             d
@@ -160,77 +208,73 @@ def main():
             if os.path.isdir(os.path.join(base_folder, d))
         ]
     )
-
-    all_results = []
-
     for subdir_name in subdirs:
         subdir_path = os.path.join(base_folder, subdir_name)
-        print(f"\n--- Processing directory: {subdir_name} ---")
-
         files = sorted(
             [f for f in os.listdir(subdir_path) if f.endswith(".edf")]
         )
-
         for file in files:
-            # Relative path for tracking in CSV
             rel_path = os.path.join(subdir_name, file)
+            if rel_path not in processed_files:
+                if len(file.replace(".edf", "").split("_", 1)) >= 2:
+                    tasks.append(
+                        (
+                            base_folder,
+                            subdir_name,
+                            file,
+                            fs,
+                            win_size,
+                            step_size,
+                        )
+                    )
 
-            if rel_path in processed_files:
-                continue
+    print(f"Total files to process: {len(tasks)}")
 
-            print(f"Processing file: {file}")
-            parts = file.replace(".edf", "").split("_", 1)
-            if len(parts) < 2:
-                continue
+    # Parquet writer initialization
+    writer = None
+    count = 0
 
-            edf_path = os.path.join(subdir_path, file)
-            ecg, ppg, _ = read_edf_signals(edf_path)
+    max_workers = 4
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_relpath = {
+            executor.submit(process_single_edf, task): os.path.join(
+                task[1], task[2]
+            )
+            for task in tasks
+        }
 
-            if ecg is None or ppg is None:
-                print(f"Skipping {file}: Missing signal data")
-                continue
+        for future in as_completed(future_to_relpath):
+            rel_path = future_to_relpath[future]
+            try:
+                file_results, returned_rel_path = future.result()
 
-            # Windowing
-            n_samples = len(ecg)
-            for section_id, start in enumerate(
-                range(0, n_samples - win_size + 1, step_size)
-            ):
-                end = start + win_size
-                ecg_slice = ecg[start:end]
-                ppg_slice = ppg[start:end]
+                if file_results:
+                    df_temp = pd.DataFrame(file_results)
+                    table = pa.Table.from_pandas(df_temp)
+                    if writer is None:
+                        writer = pq.ParquetWriter(
+                            output_file,
+                            table.schema,
+                            compression="snappy",
+                        )
+                    writer.write_table(table)
 
-                ecg_metrics = compute_metrics(ecg_slice, fs, "ecg")
-                ppg_metrics = compute_metrics(ppg_slice, fs, "ppg")
+                    with open(progress_csv, "a", newline="") as f:
+                        csv_writer = csv.writer(f)
+                        csv_writer.writerow([rel_path])
 
-                # We flatten metrics into rows. One row per signal type per section.
-                # Common metadata:
-                common_meta = {
-                    "base_folder": subdir_name,
-                    "edf_filename": file,
-                    "section_id": section_id,
-                    "start": start,
-                    "end": end,
-                }
+                    count += 1
+                    if count % 10 == 0:
+                        print(
+                            f"Processed {count}/{len(tasks)} files..."
+                        )
 
-                # ECG row
-                ecg_row = common_meta.copy()
-                ecg_row.update({"signal_type": "ecg", **ecg_metrics})
-                all_results.append(ecg_row)
+            except Exception as e:
+                print(f"Unexpected error processing {rel_path}: {e}")
 
-                # PPG row
-                ppg_row = common_meta.copy()
-                ppg_row.update({"signal_type": "ppg", **ppg_metrics})
-                all_results.append(ppg_row)
-
-            # Update progress CSV immediately after successful processing
-            with open(progress_csv, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([rel_path])
-
-    if all_results:
-        df = pd.DataFrame(all_results)
-        df.to_parquet(output_file, index=False, compression="snappy")
-        print(f"Evaluation complete. Results saved to {output_file}")
+    if writer:
+        writer.close()
+        print(f"Evaluation complete. Results streamed to {output_file}")
     else:
         print("No results to save.")
 

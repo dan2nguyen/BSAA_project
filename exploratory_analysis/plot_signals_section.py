@@ -17,52 +17,20 @@ sys.path.append(str(root_dir))
 from utils.read_edf import read_edf_signals
 
 
-def load_all_sections(eval_root=r"data\evaluation_results.parquet"):
-    """Loads evaluation results from a Parquet file and flattens them."""
+def load_evaluation_data(eval_root=r"references\evaluation_results.parquet"):
+    """Loads evaluation results from a Parquet file."""
     if not os.path.exists(eval_root):
         print(f"Evaluation file {eval_root} not found.")
-        return []
+        return None
 
     try:
+        print(f"Loading Parquet file: {eval_root}...")
         df = pd.read_parquet(eval_root)
-        # We need to group by section to get both ECG and PPG metrics for the visualizer
-        # as the original JSON structure had: section_id -> {ecg: ..., ppg: ...}
-        sections = []
-
-        # Grouping by the unique identifier of a section: base_folder, edf_filename, section_id
-        grouped = df.groupby(["base_folder", "edf_filename", "section_id"])
-
-        for (base_folder, edf_filename, section_id), group in grouped:
-            # Extract metrics for each signal type
-            ecg_row = group[group["signal_type"] == "ecg"]
-            ppg_row = group[group["signal_type"] == "ppg"]
-
-            if ecg_row.empty or ppg_row.empty:
-                continue
-
-            ecg_data = ecg_row.iloc[0].to_dict()
-            ppg_data = ppg_row.iloc[0].to_dict()
-
-            # Remove the metadata columns from the metrics dictionaries
-            meta_cols = ["base_folder", "edf_filename", "section_id", "start", "end", "signal_type"]
-            ecg_metrics = {k: v for k, v in ecg_data.items() if k not in meta_cols}
-            ppg_metrics = {k: v for k, v in ppg_data.items() if k not in meta_cols}
-
-            sections.append(
-                {
-                    "rel_json_path": os.path.join(base_folder, edf_filename),
-                    "section_id": str(section_id),
-                    "indexing": [ecg_data["start"], ecg_data["end"]],
-                    "ecg_metrics": ecg_metrics,
-                    "ppg_metrics": ppg_metrics,
-                    "edf_filename": edf_filename,
-                }
-            )
+        print(f"Successfully loaded {len(df)} sections.")
+        return df
     except Exception as e:
         print(f"Error loading Parquet file {eval_root}: {e}")
-        return []
-
-    return sections
+        return None
 
 
 class SignalVisualizer:
@@ -101,23 +69,30 @@ class SignalVisualizer:
             target_id = str(self.specific_config.get("section_num"))
             target_time = self.specific_config.get("section_time")
 
-            for i, s in enumerate(self.sections):
-                # Check file match (normalize paths)
-                if (
-                    os.path.normpath(s["rel_json_path"])
-                    == os.path.normpath(target_file)
-                    and target_id
-                    and s["section_id"] == target_id
-                ):
-                    return i
-                if (
-                    os.path.normpath(s["rel_json_path"])
-                    == os.path.normpath(target_file)
-                    and target_time is not None
-                    and abs(s["indexing"][0] / 100.0 - target_time)
-                    < 0.5
-                ):
-                    return i
+            # Filter for file match
+            # Since rel_edf_path was constructed as base_folder + edf_filename
+            # we check if combined path matches target_file
+            mask = (
+                self.sections["base_folder"]
+                + "\\"
+                + self.sections["edf_filename"]
+            ).apply(os.path.normpath) == os.path.normpath(target_file)
+            matching_indices = self.sections.index[mask].tolist()
+
+            if matching_indices:
+                for idx in matching_indices:
+                    row = self.sections.loc[idx]
+                    if (
+                        target_id
+                        and str(row["section_id"]) == target_id
+                    ):
+                        return idx
+                    if (
+                        target_time is not None
+                        and abs(row["start"] / 100.0 - target_time)
+                        < 0.5
+                    ):
+                        return idx
 
         print("Specific section not found, falling back to random.")
         return random.randint(0, len(self.sections) - 1)
@@ -130,40 +105,43 @@ class SignalVisualizer:
         else:
             # In specific mode, "Next" can either do nothing or move to next section of SAME file
             # Let's make it move to the next section of the same file for convenience
-            current_sec = self.sections[self.current_section_idx]
-            next_idx = self.current_section_idx + 1
-            while next_idx < len(self.sections):
-                if (
-                    self.sections[next_idx]["rel_json_path"]
-                    == current_sec["rel_json_path"]
-                ):
-                    self.current_section_idx = next_idx
-                    break
-                next_idx += 1
-            if next_idx == len(self.sections):
-                # Wrap around to first section of the same file
-                for i, s in enumerate(self.sections):
-                    if (
-                        s["rel_json_path"]
-                        == current_sec["rel_json_path"]
-                    ):
-                        self.current_section_idx = i
-                        break
+            current_row = self.sections.loc[self.current_section_idx]
+            current_file = os.path.normpath(
+                os.path.join(
+                    current_row["base_folder"],
+                    current_row["edf_filename"],
+                )
+            )
+
+            # Find all indices with the same file
+            mask = (
+                self.sections["base_folder"]
+                + "\\"
+                + self.sections["edf_filename"]
+            ).apply(os.path.normpath) == current_file
+            matching_indices = self.sections.index[mask].tolist()
+
+            # Find current position in the list of matching indices
+            try:
+                pos = matching_indices.index(self.current_section_idx)
+                next_pos = (pos + 1) % len(matching_indices)
+                self.current_section_idx = matching_indices[next_pos]
+            except ValueError:
+                # Fallback if for some reason current_section_idx is not in matching_indices
+                self.current_section_idx = matching_indices[0]
         self.update_plot()
 
     def update_plot(self):
-        section = self.sections[self.current_section_idx]
+        row = self.sections.loc[self.current_section_idx]
 
-        # Need to find the EDF file. The sections list has edf_filename.
-        # We need the subdir from the rel_json_path.
-        rel_path = section["rel_json_path"]
-        subdir = os.path.dirname(rel_path)
-        filename = section["edf_filename"]
+        # Construct file path from DataFrame row
+        subdir = row["base_folder"]
+        filename = row["edf_filename"]
         file_path = os.path.join(self.base_path, subdir, filename)
 
         try:
-            ecg, ppg, meta = read_edf_signals(file_path)  # noqa: RUF059
-        except Exception as e:  # noqa: BLE001
+            ecg, ppg, _ = read_edf_signals(file_path)
+        except Exception as e:
             print(f"Error loading {file_path}: {e}")
             return
 
@@ -171,7 +149,7 @@ class SignalVisualizer:
             print(f"Error loading {file_path}: Missing signal data")
             return
 
-        start, end = section["indexing"]
+        start, end = row["start"], row["end"]
         ecg_slice = ecg[start:end]
         ppg_slice = ppg[start:end]
 
@@ -181,7 +159,7 @@ class SignalVisualizer:
         self.ax_ecg.clear()
         self.ax_ecg.plot(time, ecg_slice, color="blue")
         self.ax_ecg.set_title(
-            f"ECG - {rel_path} | Sec {section['section_id']}"
+            f"ECG - {os.path.join(subdir, filename)} | Sec {row['section_id']}"
         )
         self.ax_ecg.set_ylabel("Amplitude")
         self.ax_ecg.grid(True)
@@ -189,7 +167,7 @@ class SignalVisualizer:
         self.ax_ppg.clear()
         self.ax_ppg.plot(time, ppg_slice, color="red")
         self.ax_ppg.set_title(
-            f"PPG - {rel_path} | Sec {section['section_id']}"
+            f"PPG - {os.path.join(subdir, filename)} | Sec {row['section_id']}"
         )
         self.ax_ppg.set_xlabel("Time (s)")
         self.ax_ppg.set_ylabel("Amplitude")
@@ -201,7 +179,12 @@ class SignalVisualizer:
 
         text_lines = []
         for sig_type in ["ecg", "ppg"]:
-            metrics = section[f"{sig_type}_metrics"]
+            # Filter columns that start with the signal type
+            metrics = {
+                k: v
+                for k, v in row.items()
+                if k.startswith(f"{sig_type}_")
+            }
             text_lines.append(f"--- {sig_type.upper()} ---")
             for k, v in metrics.items():
                 if isinstance(v, bool):
@@ -210,7 +193,7 @@ class SignalVisualizer:
                 elif k != "std_piecewise":
                     try:
                         text_lines.append(f"{k}: {v:.4f}")
-                    except:  # noqa: E722
+                    except (TypeError, ValueError):
                         text_lines.append(f"{k}: {v}")
             text_lines.append("")
 
@@ -262,9 +245,13 @@ def main():
         return
 
     # 2. Load all sections from the new structure
-    sections = load_all_sections(r"data\evaluation_results.parquet")
-    if not sections:
-        print("No evaluation sections found in 'data\\evaluation_results.parquet'.")
+    df_sections = load_evaluation_data(
+        r"references\evaluation_results.parquet"
+    )
+    if df_sections is None or df_sections.empty:
+        print(
+            "No evaluation sections found in 'references\\evaluation_results.parquet'."
+        )
         return
 
     # 3. Handle Specific Mode Configuration
@@ -275,11 +262,10 @@ def main():
             print(
                 "No --file provided. Please select the JSON file from the evaluation results folder."
             )
-            # We need to let the user select a file from the evaluation_results directory
+            # We need to let the user select a file from the evaluation_results folder
             target_file = filedialog.askopenfilename(
                 initialdir="evaluation_results",
                 title="Select Evaluation JSON File",
-                filetypes=[("JSON files", "*.json")],
             )
             if not target_file:
                 print("No file selected. Exiting.")
@@ -293,12 +279,13 @@ def main():
         section_num = args.section_num
         if section_num is None:
             try:
+                # Use input() but be aware it may not work in some terminal environments
                 section_num = int(
                     input("Enter section number to plot: ")
                 )
             except ValueError:
                 print(
-                    "Invalid input. Defaulting to first section of the file."
+                    "Invalid input. Defaulting to first section of, the same file."
                 )
                 section_num = 0
 
@@ -310,7 +297,7 @@ def main():
 
     SignalVisualizer(
         base_path,
-        sections,
+        df_sections,
         mode=args.mode,
         specific_config=specific_config,
     )

@@ -11,7 +11,7 @@ import numpy as np
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
-from eploratory_analysis.filters import apply_standard_filters
+from exploratory_analysis.filters import apply_standard_filters
 from utils.read_edf import read_edf_signals
 
 
@@ -83,7 +83,7 @@ def main():
                 if len(ch_names) < 2:
                     ch_names = ["ECG", "PPG"]
 
-                data_ecg = f_ecg / 1e6
+                data_ecg = f_ecg
                 data_ppg = f_ppg  # PPG stays raw/misc
 
                 data = np.vstack([data_ecg, data_ppg])
