@@ -8,12 +8,14 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "edfio>=0.4.18",
     "matplotlib>=3.11.2",
     "mne>=1.13.2",
     "numpy>=2.5.3",
     "pandas>=3.0.6",
     "pyarrow>=26.0.0",
     "scipy>=1.18.1",
+    "sleepecg>=0.5.9",
 ]
 
 [project.scripts]
