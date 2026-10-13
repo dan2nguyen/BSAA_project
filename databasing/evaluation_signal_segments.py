@@ -1,3 +1,30 @@
+"""
+This script evaluates the quality of ECG and PPG signal segments from EDF files.
+It slides a window across the signals and computes a set of quality metrics for each segment.
+
+Functions:
+- compute_metrics(x, fs, signal_type):
+    Input: signal slice (x), sampling frequency (fs), signal type ('ecg' or 'ppg').
+    Output: Dictionary of quality metrics (std, flatness, spectral ratios, etc.).
+- process_single_edf(task_info):
+    Input: Tuple containing folder paths, filename, fs, window/step sizes, and shortening flag.
+    Output: Tuple of (list of results per segment, relative file path).
+- main():
+    Input: Command line arguments (base folder, output file).
+    Output: Parquet file with evaluated metrics and a progress CSV.
+
+Inputs:
+    - Base directory containing subdirectories with .edf files.
+    - Window size (samples) and step size (samples) for segmentation.
+    - Optional output file path.
+
+Outputs:
+    - A Parquet file containing a wide-format table with:
+        - Metadata: folder, filename, section ID, start/end samples.
+        - Signal Metrics: A set of quality metrics for both ECG and PPG (e.g., flatness, spikes, spectral ratios).
+    - A 'processed_files.csv' to track progress and avoid re-processing files. (In case of interruption, the script can resume from where it left off.)
+"""
+
 import csv
 import itertools
 import os
@@ -69,11 +96,6 @@ def compute_metrics(x, fs, signal_type):
     kurt = float(scipy.stats.kurtosis(x, fisher=False))
     skew = float(scipy.stats.skew(x))
 
-    std_flat = len([v for v in std_piecewise if v < 1e-6]) >= 3
-    zero_dev_flat = zero_dev_dur > 4.0
-    mean_abs_der_spike = mean_abs_der > (2.0 * std)
-    lf_ratio_motion = lf_ratio > 0.6
-
     if signal_type == "ecg":
         dynamic_range_flat = dynamic_range < 1e-5
         inband_out = inband_ratio < 0.40
@@ -84,6 +106,13 @@ def compute_metrics(x, fs, signal_type):
         inband_out = inband_ratio < 0.50
         kurtosis_out = kurt < 2.0 or kurt > 10.0
         skewness_out = skew < 0.0
+
+    std_flat = len([v for v in std_piecewise if v < 1e-6]) >= 3
+    zero_dev_flat = zero_dev_dur > 4.0
+    mean_abs_der_spike = mean_abs_der > (2.0 * std)
+    lf_ratio_motion = lf_ratio > 0.6
+
+    is_flat = sum([std_flat, zero_dev_flat, dynamic_range_flat]) >= 2
 
     return {
         "std": std,
@@ -96,8 +125,9 @@ def compute_metrics(x, fs, signal_type):
         "kurtosis": kurt,
         "Skewness": skew,
         "std_flat": std_flat,
-        "zero_dev_flat": zero_dev_dur > 4.0,  # redundancy
+        "zero_dev_flat": zero_dev_flat,
         "dynamic_range_flat": dynamic_range_flat,
+        "is_flat": is_flat,
         "mean_absolute_derivative_spike": mean_abs_der_spike,
         "LF_ratio_motion": lf_ratio_motion,
         "InBand_power_ratio_out": inband_out,
@@ -108,7 +138,9 @@ def compute_metrics(x, fs, signal_type):
 
 def process_single_edf(task_info):
     """Worker function to process one EDF file."""
-    base_folder, subdir_name, file, fs, win_size, step_size = task_info
+    base_folder, subdir_name, file, fs, win_size, step_size, shorten = (
+        task_info
+    )
 
     rel_path = os.path.join(subdir_name, file)
     try:
@@ -140,10 +172,21 @@ def process_single_edf(task_info):
             }
 
             # Prefix metrics to avoid collisions
+            metrics_to_keep = [
+                "is_flat",
+                "mean_absolute_derivative_spike",
+                "LF_ratio_motion",
+                "InBand_power_ratio_out",
+                "kurtosis_out",
+                "Skewness_out",
+            ]
+
             for k, v in ecg_metrics.items():
-                row[f"ecg_{k}"] = v
+                if not shorten or k in metrics_to_keep:
+                    row[f"ecg_{k}"] = v
             for k, v in ppg_metrics.items():
-                row[f"ppg_{k}"] = v
+                if not shorten or k in metrics_to_keep:
+                    row[f"ppg_{k}"] = v
 
             file_results.append(row)
 
@@ -173,17 +216,23 @@ def main():
             return
 
     # Define output file
+    fs = 100
+    win_size = 2000
+    step_size = 1000
+    shorten = True
+
     if len(sys.argv) > 2:
         output_file = sys.argv[2]
     else:
-        output_file = r"references\evaluation_results.parquet"
+        output_file = rf"databasing\references\evaluation_results_win{win_size}.parquet"
 
     output_dir = os.path.dirname(output_file)
     if output_dir and not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
+    proccessed_file_name = rf"processed_files{win_size}.csv"
     progress_csv = os.path.join(
-        output_dir if output_dir else ".", "processed_files.csv"
+        output_dir if output_dir else ".", proccessed_file_name
     )
 
     processed_files = set()
@@ -194,10 +243,6 @@ def main():
                 if row:
                     processed_files.add(row[0])
         print(f"Loaded {len(processed_files)} already processed files.")
-
-    fs = 100
-    win_size = 1000
-    step_size = 500
 
     # Collect all tasks
     tasks = []
@@ -215,18 +260,21 @@ def main():
         )
         for file in files:
             rel_path = os.path.join(subdir_name, file)
-            if rel_path not in processed_files:
-                if len(file.replace(".edf", "").split("_", 1)) >= 2:
-                    tasks.append(
-                        (
-                            base_folder,
-                            subdir_name,
-                            file,
-                            fs,
-                            win_size,
-                            step_size,
-                        )
+            if (
+                rel_path not in processed_files
+                and len(file.replace(".edf", "").split("_", 1)) >= 2
+            ):
+                tasks.append(
+                    (
+                        base_folder,
+                        subdir_name,
+                        file,
+                        fs,
+                        win_size,
+                        step_size,
+                        shorten,
                     )
+                )
 
     print(f"Total files to process: {len(tasks)}")
 

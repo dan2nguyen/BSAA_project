@@ -17,7 +17,9 @@ sys.path.append(str(root_dir))
 from utils.read_edf import read_edf_signals
 
 
-def load_evaluation_data(eval_root=r"references\evaluation_results.parquet"):
+def load_evaluation_data(
+    eval_root=r"references\evaluation_results.parquet",
+):
     """Loads evaluation results from a Parquet file."""
     if not os.path.exists(eval_root):
         print(f"Evaluation file {eval_root} not found.")
@@ -33,14 +35,36 @@ def load_evaluation_data(eval_root=r"references\evaluation_results.parquet"):
         return None
 
 
+def load_corrupted_data(
+    corr_root=r"references\corrupted_sections.parquet",
+):
+    """Loads corrupted section data from a Parquet file."""
+    if not os.path.exists(corr_root):
+        print(f"Corrupted sections file {corr_root} not found.")
+        return None
+
+    try:
+        df = pd.read_parquet(corr_root)
+        return df
+    except Exception as e:
+        print(f"Error loading corrupted sections file {corr_root}: {e}")
+        return None
+
+
 class SignalVisualizer:
     def __init__(
-        self, base_path, sections, mode="random", specific_config=None
+        self,
+        base_path,
+        sections,
+        mode="random",
+        specific_config=None,
+        corrupted_df=None,
     ):
         self.base_path = base_path
         self.sections = sections
         self.mode = mode
         self.specific_config = specific_config
+        self.corrupted_df = corrupted_df
 
         self.fig, (self.ax_ecg, self.ax_ppg) = plt.subplots(
             2, 1, figsize=(12, 8), sharex=True
@@ -132,11 +156,16 @@ class SignalVisualizer:
         self.update_plot()
 
     def update_plot(self):
-        row = self.sections.loc[self.current_section_idx]
+        # Use .iloc if current_section_idx is an integer position, or squeeze if multiple rows match
+        # To avoid KeyError, we ensure we access the row as a Series from the DataFrame
+        row = self.sections.iloc[self.current_section_idx]
+        if isinstance(row, pd.DataFrame):
+            row = row.iloc[0]
 
         # Construct file path from DataFrame row
-        subdir = row["base_folder"]
-        filename = row["edf_filename"]
+        # We use .get() or check columns to avoid KeyError if the merge changed something
+        subdir = str(row["base_folder"])
+        filename = str(row["edf_filename"])
         file_path = os.path.join(self.base_path, subdir, filename)
 
         try:
@@ -149,7 +178,37 @@ class SignalVisualizer:
             print(f"Error loading {file_path}: Missing signal data")
             return
 
-        start, end = row["start"], row["end"]
+        # Ensure we are using values, not series/index
+        # Access values safely
+        try:
+            start_col = (
+                "start"
+                if "start" in row
+                else ("start_x" if "start_x" in row else None)
+            )
+            end_col = (
+                "end"
+                if "end" in row
+                else ("end_x" if "end_x" in row else None)
+            )
+
+            if start_col is None or end_col is None:
+                print(
+                    f"Error: Missing start/end columns. Available: {self.sections.columns.tolist()}"
+                )
+                return
+
+            start = int(row[start_col])
+            end = int(row[end_col])
+        except KeyError as e:
+            print(
+                f"Error: Column {e} not found in the filtered sections DataFrame."
+            )
+            print(
+                f"Available columns: {self.sections.columns.tolist()}"
+            )
+            return
+
         ecg_slice = ecg[start:end]
         ppg_slice = ppg[start:end]
 
@@ -178,6 +237,48 @@ class SignalVisualizer:
         self.ax_text.axis("off")
 
         text_lines = []
+
+        # Add Corruption Status (from corrupted_df)
+        if self.corrupted_df is not None:
+            # Match corruption row to current section
+            # Use a merge-like approach or indexing if indices align, but usually we match on keys
+            match = self.corrupted_df[
+                (self.corrupted_df["base_folder"] == subdir)
+                & (self.corrupted_df["edf_filename"] == filename)
+                & (self.corrupted_df["section_id"] == row["section_id"])
+            ]
+            if not match.empty:
+                corr_row = match.iloc[0]
+                # notFlat: True (Green) / False (Red)
+                # no_abnormal_waves: True (Green) / False (Red)
+                nf_val = corr_row.get("notFlat", None)
+                naw_val = corr_row.get("no_abnormal_waves", None)
+
+                text_lines.append("--- CORRUPTION STATUS ---")
+                # We use colored circles or markers in text if possible, or just labels.
+                # In Matplotlib text, we can't easily change color per word,
+                # so we'll add these as separate text objects or just use labels.
+                # For simplicity in the monospace block, we use [OK] / [CORRUPT]
+                # but I'll add a separate logic to draw indicators if requested.
+                # The prompt asks for "red or green depending on whether the value is true or false".
+                # Since this is in the text box (ax_text), I'll add labels and then
+                # maybe draw small colored rectangles on the plot.
+                nf_label = (
+                    "NOT FLAT: OK" if nf_val else "NOT FLAT: CORRUPT"
+                )
+                naw_label = (
+                    "NO ABNORMAL: OK"
+                    if naw_val
+                    else "NO ABNORMAL: CORRUPT"
+                )
+                text_lines.append(nf_label)
+                text_lines.append(naw_label)
+                text_lines.append("")
+            else:
+                text_lines.append(
+                    "Corruption data not found for this section\n"
+                )
+
         for sig_type in ["ecg", "ppg"]:
             # Filter columns that start with the signal type
             metrics = {
@@ -207,6 +308,58 @@ class SignalVisualizer:
             fontsize=9,
         )
 
+        # Draw colored status indicators
+        if self.corrupted_df is not None:
+            match = self.corrupted_df[
+                (self.corrupted_df["base_folder"] == subdir)
+                & (self.corrupted_df["edf_filename"] == filename)
+                & (self.corrupted_df["section_id"] == row["section_id"])
+            ]
+            if not match.empty:
+                corr_row = match.iloc[0]
+                nf_color = (
+                    "green" if corr_row.get("notFlat", False) else "red"
+                )
+                naw_color = (
+                    "green"
+                    if corr_row.get("no_abnormal_waves", False)
+                    else "red"
+                )
+
+                # Add indicators to the top right of the figure
+                self.fig.text(
+                    0.76,
+                    0.95,
+                    "Flat",
+                    color="black",
+                    fontsize=10,
+                    ha="right",
+                )
+                self.fig.text(
+                    0.77,
+                    0.95,
+                    " ● ",
+                    color=nf_color,
+                    fontsize=15,
+                    ha="left",
+                )
+                self.fig.text(
+                    0.76,
+                    0.92,
+                    "Abnormal",
+                    color="black",
+                    fontsize=10,
+                    ha="right",
+                )
+                self.fig.text(
+                    0.77,
+                    0.92,
+                    " ● ",
+                    color=naw_color,
+                    fontsize=15,
+                    ha="left",
+                )
+
         plt.draw()
 
 
@@ -219,6 +372,21 @@ def main():
         choices=["random", "specific"],
         default="random",
         help="Selection mode",
+    )
+    parser.add_argument(
+        "--filter",
+        choices=[
+            "notFlat_True",
+            "notFlat_False",
+            "no_abnormal_waves_True",
+            "no_abnormal_waves_False",
+            "both_True",
+            "both_False",
+            "either_corrupted",
+            "neither",
+        ],
+        default="neither",
+        help="Filter random sections based on corrupted_sections.parquet values",
     )
     parser.add_argument(
         "--file",
@@ -254,7 +422,60 @@ def main():
         )
         return
 
-    # 3. Handle Specific Mode Configuration
+    # 3. Load corruption data for filtering and display
+    df_corrupted = load_corrupted_data(
+        r"references\corrupted_sections.parquet"
+    )
+
+    # 4. Filter sections if in random mode and filter is specified
+    if (
+        args.mode == "random"
+        and args.filter != "neither"
+        and df_corrupted is not None
+    ):
+        print(f"Filtering sections by {args.filter}...")
+
+        # Join evaluation results with corrupted sections on common keys
+        # The keys are base_folder, edf_filename, section_id
+        merged = df_sections.merge(
+            df_corrupted,
+            on=["base_folder", "edf_filename", "section_id"],
+            how="inner",
+        )
+
+        if args.filter == "notFlat_True":
+            mask = merged["notFlat"] == True
+        elif args.filter == "notFlat_False":
+            mask = merged["notFlat"] == False
+        elif args.filter == "no_abnormal_waves_True":
+            mask = merged["no_abnormal_waves"] == True
+        elif args.filter == "no_abnormal_waves_False":
+            mask = merged["no_abnormal_waves"] == False
+        elif args.filter == "both_True":
+            mask = (merged["notFlat"] == True) & (
+                merged["no_abnormal_waves"] == True
+            )
+        elif args.filter == "both_False":
+            mask = (merged["notFlat"] == False) & (
+                merged["no_abnormal_waves"] == False
+            )
+        elif args.filter == "either_corrupted":
+            mask = (merged["notFlat"] == False) | (
+                merged["no_abnormal_waves"] == False
+            )
+        else:
+            mask = pd.Series(True, index=merged.index)
+
+        filtered_sections = merged[mask].copy()
+
+        if filtered_sections.empty:
+            print("No sections match the selected corruption filter.")
+            return
+
+        df_sections = filtered_sections
+        print(f"Filtered down to {len(df_sections)} sections.")
+
+    # 5. Handle Specific Mode Configuration
     specific_config = None
     if args.mode == "specific":
         target_file = args.file
@@ -300,6 +521,7 @@ def main():
         df_sections,
         mode=args.mode,
         specific_config=specific_config,
+        corrupted_df=df_corrupted,
     )
     plt.show()
 

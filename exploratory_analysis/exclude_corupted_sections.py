@@ -53,12 +53,12 @@ def generate_exclusion_file():
         abnormal_cols = [
             "ppg_mean_absolute_derivative_spike",
             "ppg_LF_ratio_motion",
-            "ppg_InBand_power_ratio",
+            "ppg_InBand_power_ratio_out",
             "ppg_kurtosis_out",
             "ppg_Skewness_out",
             "ecg_mean_absolute_derivative_spike",
             "ecg_LF_ratio_motion",
-            "ecg_InBand_power_ratio",
+            "ecg_InBand_power_ratio_out",
             "ecg_kurtosis_out",
             "ecg_Skewness_out",
         ]

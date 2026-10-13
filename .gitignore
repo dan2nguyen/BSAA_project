@@ -6,7 +6,8 @@ __pycache__/
 task_quality.txt
 tasks.md
 signal_quality_evaluation.json
-evaluation_results.parquet
+evaluation_results*
+processed_files*
 
 # C extensions
 *.so
