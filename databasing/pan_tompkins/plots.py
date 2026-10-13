@@ -9,8 +9,11 @@ import pandas as pd
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
-from pan_tompkins.detection import pan_tompkins_stages, pan_tompkins_threshold
-from pan_tompkins.heart_rate import estimate_hr
+from databasing.pan_tompkins.detection import (
+    pan_tompkins_stages,
+    pan_tompkins_threshold,
+)
+from databasing.pan_tompkins.heart_rate import estimate_hr
 from utils.read_edf import read_edf_signals
 
 DEFAULT_EDF = (
@@ -79,7 +82,9 @@ def _slice_window(n_samples, fs, start_s, duration_s):
 def _merge_runs(segments: pd.DataFrame) -> list[tuple[float, float]]:
     """Merges touching segments into (start_s, end_s) runs."""
     runs = []
-    for seg_start, seg_end in zip(segments["start_s"], segments["end_s"]):
+    for seg_start, seg_end in zip(
+        segments["start_s"], segments["end_s"]
+    ):
         if runs and seg_start <= runs[-1][1]:
             runs[-1][1] = max(runs[-1][1], seg_end)
         else:
@@ -89,7 +94,9 @@ def _merge_runs(segments: pd.DataFrame) -> list[tuple[float, float]]:
 
 def _shade_invalid_segments(ax, hr: pd.DataFrame, x_scale: float = 1.0):
     """Draws gray bands over invalid segments, neighbours are merged."""
-    for i, (band_start, band_end) in enumerate(_merge_runs(hr[~hr["valid"]])):
+    for i, (band_start, band_end) in enumerate(
+        _merge_runs(hr[~hr["valid"]])
+    ):
         ax.axvspan(
             band_start / x_scale,
             band_end / x_scale,
@@ -111,7 +118,9 @@ def _format_duration(seconds: float) -> str:
 
 def _add_title_and_legend(ax, title: str, ncols: int = 4):
     """Puts the title on top and the legend in a row between it and the plot."""
-    ax.set_title(title, color=TEXT_COLOR, fontsize=12, loc="left", pad=28)
+    ax.set_title(
+        title, color=TEXT_COLOR, fontsize=12, loc="left", pad=28
+    )
     ax.legend(
         loc="lower left",
         bbox_to_anchor=(0.0, 1.0),
@@ -179,7 +188,9 @@ def plot_ecg_with_peaks(
         accepted = np.zeros(len(window_peaks), dtype=bool)
         valid = segments[segments["valid"]]
         for seg_start, seg_end in zip(valid["start"], valid["end"]):
-            accepted |= (window_peaks >= seg_start) & (window_peaks < seg_end)
+            accepted |= (window_peaks >= seg_start) & (
+                window_peaks < seg_end
+            )
 
     ax.plot(t, z, color=SIGNAL_COLOR, linewidth=1.3, label="ECG")
     rejected_peaks = window_peaks[~accepted]
@@ -302,7 +313,10 @@ def plot_hr_curve(
 
     # Label the dead stretches that are wide enough to hold the text
     for run_start, run_end in flat_runs:
-        visible_start, visible_end = max(run_start, x_min), min(run_end, x_max)
+        visible_start, visible_end = (
+            max(run_start, x_min),
+            min(run_end, x_max),
+        )
         if visible_end - visible_start < 0.25 * (x_max - x_min):
             continue
         ax.text(
@@ -362,7 +376,9 @@ def plot_pan_tompkins_stages(
         "squared": "4. Squaring",
         "integrated": "5. Moving window integration",
     }
-    start, end = _slice_window(len(stages["input"]), fs, start_s, duration_s)
+    start, end = _slice_window(
+        len(stages["input"]), fs, start_s, duration_s
+    )
     t = np.arange(start, end) / fs
     n_panels = len(labels) + (threshold is not None)
 
@@ -374,7 +390,9 @@ def plot_pan_tompkins_stages(
         facecolor=SURFACE,
     )
     for ax, (key, label) in zip(axes, labels.items()):
-        ax.plot(t, stages[key][start:end], color=SIGNAL_COLOR, linewidth=1.3)
+        ax.plot(
+            t, stages[key][start:end], color=SIGNAL_COLOR, linewidth=1.3
+        )
         ax.set_title(label, color=TEXT_COLOR, fontsize=10, loc="left")
 
     if threshold is not None:
@@ -429,7 +447,9 @@ def plot_pan_tompkins_stages(
         _style_axis(ax)
     axes[-1].set_xlim(t[0], t[-1])
     axes[-1].set_xlabel("Time (s)")
-    fig.suptitle(title, color=TEXT_COLOR, fontsize=12, x=0.01, ha="left")
+    fig.suptitle(
+        title, color=TEXT_COLOR, fontsize=12, x=0.01, ha="left"
+    )
     fig.tight_layout()
     return fig
 
@@ -438,7 +458,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Create the Pan-Tompkins slide plots for one EDF file."
     )
-    parser.add_argument("edf_path", type=Path, nargs="?", default=DEFAULT_EDF)
+    parser.add_argument(
+        "edf_path", type=Path, nargs="?", default=DEFAULT_EDF
+    )
     parser.add_argument(
         "--plots",
         nargs="+",
@@ -461,12 +483,20 @@ if __name__ == "__main__":
     parser.add_argument("--segment-s", type=float, default=10.0)
     parser.add_argument("--step-s", type=float, default=None)
     parser.add_argument(
-        "--hr-start-s", type=float, default=None, help="Start of the HR curve."
+        "--hr-start-s",
+        type=float,
+        default=None,
+        help="Start of the HR curve.",
     )
     parser.add_argument(
-        "--hr-end-s", type=float, default=None, help="End of the HR curve."
+        "--hr-end-s",
+        type=float,
+        default=None,
+        help="End of the HR curve.",
     )
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR
+    )
     parser.add_argument("--show", action="store_true")
     args = parser.parse_args()
 

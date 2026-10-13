@@ -7,16 +7,17 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import pandas as pd
-import pyarrow as pa
 import pyarrow.parquet as pq
 
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
-from pan_tompkins.heart_rate import estimate_hr
+from databasing.pan_tompkins.heart_rate import estimate_hr
 from utils.read_edf import read_edf_signals
 
-DEFAULT_INPUT = root_dir / "data" / "harmonized_ecg_ppg_database_filtered"
+DEFAULT_INPUT = (
+    root_dir / "data" / "harmonized_ecg_ppg_database_filtered"
+)
 DEFAULT_PARTS_ROOT = root_dir / "data" / "hr_parts"
 
 # Summary categories built from the invalid_reason values
@@ -171,12 +172,17 @@ def print_summary(stats: dict):
     table.insert(0, "files", [stats["files"][s] for s in table.index])
     table["total"] = table[CATEGORIES].sum(axis=1)
     table["valid_%"] = (
-        100.0 * table["valid"] / table["total"].where(table["total"] > 0)
+        100.0
+        * table["valid"]
+        / table["total"].where(table["total"] > 0)
     ).round(1)
     table.loc["ALL"] = table.sum(numeric_only=True)
     if table.loc["ALL", "total"] > 0:
         table.loc["ALL", "valid_%"] = round(
-            100.0 * table.loc["ALL", "valid"] / table.loc["ALL", "total"], 1
+            100.0
+            * table.loc["ALL", "valid"]
+            / table.loc["ALL", "total"],
+            1,
         )
     int_columns = ["files", *CATEGORIES, "total"]
     table[int_columns] = table[int_columns].astype(int)
@@ -237,7 +243,9 @@ if __name__ == "__main__":
     tag = f"seg{args.segment_s:g}s"
     if step_s != args.segment_s:
         tag += f"_step{step_s:g}s"
-    output_path = args.output or root_dir / "data" / f"hr_database_{tag}.parquet"
+    output_path = (
+        args.output or root_dir / "data" / f"hr_database_{tag}.parquet"
+    )
     parts_dir = args.parts_dir or DEFAULT_PARTS_ROOT / tag
 
     all_files = find_edf_files(args.input)
@@ -270,7 +278,9 @@ if __name__ == "__main__":
             hr = process_file(edf_path, args.segment_s, step_s)
             if hr is None:
                 failed.append(edf_path)
-                print(f"[{i}/{len(todo)}] {edf_path.name}: FAILED to read")
+                print(
+                    f"[{i}/{len(todo)}] {edf_path.name}: FAILED to read"
+                )
                 continue
             write_parquet_atomic(hr, part_path_for(edf_path, parts_dir))
             done_bytes += edf_path.stat().st_size
@@ -288,7 +298,9 @@ if __name__ == "__main__":
         sys.exit(130)
 
     elapsed = time.perf_counter() - t_start
-    print(f"\nProcessed {len(todo) - len(failed)} files in {elapsed:.1f} s.")
+    print(
+        f"\nProcessed {len(todo) - len(failed)} files in {elapsed:.1f} s."
+    )
     if done_bytes and args.limit is not None:
         # Processing time scales with the recording length, i.e. file size
         total_bytes = sum(f.stat().st_size for f in all_files)
@@ -299,7 +311,9 @@ if __name__ == "__main__":
             f" ({len(all_files)} files)."
         )
     if failed:
-        print(f"{len(failed)} files failed (they are retried on the next run):")
+        print(
+            f"{len(failed)} files failed (they are retried on the next run):"
+        )
         for f in failed:
             print(f"  {f}")
 
@@ -310,7 +324,9 @@ if __name__ == "__main__":
     ]
     if args.limit is not None:
         stats = assemble_database(part_paths, None)
-        print("Test run (--limit): the final database file was not written.")
+        print(
+            "Test run (--limit): the final database file was not written."
+        )
     else:
         stats = assemble_database(part_paths, output_path)
         print(f"Saved {stats['rows']} segments to {output_path}")

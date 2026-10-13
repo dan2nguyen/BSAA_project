@@ -294,7 +294,7 @@ def main():
         for future in as_completed(future_to_relpath):
             rel_path = future_to_relpath[future]
             try:
-                file_results, returned_rel_path = future.result()
+                file_results, _ = future.result()
 
                 if file_results:
                     df_temp = pd.DataFrame(file_results)
@@ -317,7 +317,7 @@ def main():
                             f"Processed {count}/{len(tasks)} files..."
                         )
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"Unexpected error processing {rel_path}: {e}")
 
     if writer:

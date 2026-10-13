@@ -8,8 +8,8 @@ import pandas as pd
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
 
-from pan_tompkins.detection import detect_qrs
-from pan_tompkins.quality import check_segment_quality
+from databasing.pan_tompkins.detection import detect_qrs
+from databasing.pan_tompkins.quality import check_segment_quality
 from utils.read_edf import read_edf_signals
 
 MIN_BEATS = 3
@@ -194,4 +194,6 @@ if __name__ == "__main__":
 
     hr, peaks = estimate_hr(ecg, fs, args.segment_s, args.step_s)
     print(hr.to_string())
-    print(f"\n{len(peaks)} beats, median HR {hr['hr_bpm'].median():.1f} bpm")
+    print(
+        f"\n{len(peaks)} beats, median HR {hr['hr_bpm'].median():.1f} bpm"
+    )
