@@ -5,11 +5,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-root_dir = Path(__file__).resolve().parent.parent
+root_dir = Path(__file__).resolve().parents[2]
 sys.path.append(str(root_dir))
 
+from databasing.evaluation_signal_segments import compute_metrics
 from databasing.pan_tompkins.detection import detect_qrs
-from databasing.pan_tompkins.quality import check_segment_quality
 from utils.read_edf import read_edf_signals
 
 MIN_BEATS = 3
@@ -79,8 +79,8 @@ def compute_hr_segments(
     """
     if step_s is None:
         step_s = segment_s
-    seg_len = int(round(segment_s * fs))
-    step = int(round(step_s * fs))
+    seg_len = round(segment_s * fs)
+    step = round(step_s * fs)
     if seg_len <= 0 or step <= 0:
         raise ValueError("segment_s and step_s must be positive")
 
@@ -135,6 +135,46 @@ def compute_hr_segments(
     return pd.DataFrame(rows, columns=SEGMENT_COLUMNS)
 
 
+def ecg_flat_flags(
+    ecg: np.ndarray, fs: float, hr: pd.DataFrame
+) -> np.ndarray:
+    """
+    Evaluates the flatness of every segment of `hr` with the shared
+    quality metrics (`compute_metrics` in evaluation_signal_segments.py).
+
+    Args:
+        ecg (np.ndarray): 1D ECG signal (whole recording).
+        fs (float): Sampling rate in Hz.
+        hr (pd.DataFrame): Segments as returned by `compute_hr_segments`.
+
+    Returns:
+        np.ndarray: Boolean array, True for flat (dead) ECG segments.
+    """
+    return np.array(
+        [
+            bool(compute_metrics(ecg[start:end], fs, "ecg")["is_flat"])
+            for start, end in zip(hr["start"], hr["end"])
+        ],
+        dtype=bool,
+    )
+
+
+def mark_flat_segments(hr: pd.DataFrame, is_flat: np.ndarray):
+    """
+    Invalidates the segments with flat ECG in place: NaN in all HR/RR
+    columns and invalid_reason "flat_ecg", which has priority over the
+    beat-based reasons from `compute_hr_segments`.
+
+    Args:
+        hr (pd.DataFrame): Segments as returned by `compute_hr_segments`.
+        is_flat (np.ndarray): Boolean array, one value per segment.
+    """
+    is_flat = np.asarray(is_flat, dtype=bool)
+    hr.loc[is_flat, HR_COLUMNS] = np.nan
+    hr.loc[is_flat, "valid"] = False
+    hr.loc[is_flat, "invalid_reason"] = "flat_ecg"
+
+
 def estimate_hr(
     ecg: np.ndarray,
     fs: float,
@@ -143,11 +183,10 @@ def estimate_hr(
 ) -> tuple[pd.DataFrame, np.ndarray]:
     """
     Runs the whole pipeline on one ECG signal: QRS detection, segment-wise
-    HR and the segment quality check.
+    HR and the flat-signal check.
 
-    Segments failing the quality check get NaN in all HR/RR columns
-    (including rr_cv) and the quality reason in `invalid_reason` (it has
-    priority over the beat-based reasons from `compute_hr_segments`).
+    Segments with flat ECG get NaN in all HR/RR columns (including rr_cv)
+    and invalid_reason "flat_ecg".
 
     Args:
         ecg (np.ndarray): 1D ECG signal (already filtered).
@@ -162,19 +201,8 @@ def estimate_hr(
     """
     peaks = detect_qrs(ecg, fs)
     hr = compute_hr_segments(peaks, len(ecg), fs, segment_s, step_s)
-
-    if hr.empty:
-        return hr, peaks
-
-    checks = [
-        check_segment_quality(ecg[start:end])
-        for start, end in zip(hr["start"], hr["end"])
-    ]
-    bad = np.array([not ok for ok, _ in checks])
-    reasons = np.array([reason for _, reason in checks], dtype=object)
-    hr.loc[bad, HR_COLUMNS] = np.nan
-    hr.loc[bad, "valid"] = False
-    hr.loc[bad, "invalid_reason"] = reasons[bad]
+    if not hr.empty:
+        mark_flat_segments(hr, ecg_flat_flags(ecg, fs, hr))
     return hr, peaks
 
 
