@@ -42,8 +42,8 @@ def detect_qrs(
     """
     ecg = np.asarray(ecg, dtype=float)
     n_samples = len(ecg)
-    chunk = int(round(chunk_s * fs))
-    overlap = int(round(overlap_s * fs))
+    chunk = round(chunk_s * fs)
+    overlap = round(overlap_s * fs)
     if chunk <= 0:
         raise ValueError("chunk_s must be positive")
 
@@ -94,7 +94,9 @@ def pan_tompkins_stages(
             input, bandpass, derivative, squared, integrated.
     """
     ecg = np.asarray(ecg, dtype=float)
-    sos = scipy.signal.butter(2, band_hz, btype="bandpass", fs=fs, output="sos")
+    sos = scipy.signal.butter(
+        2, band_hz, btype="bandpass", fs=fs, output="sos"
+    )
     bandpass = scipy.signal.sosfiltfilt(sos, ecg)
 
     # Five-point derivative from the original paper, centered (no delay)
@@ -103,8 +105,10 @@ def pan_tompkins_stages(
 
     squared = derivative**2
 
-    window = max(int(round(window_s * fs)), 1)
-    integrated = np.convolve(squared, np.ones(window) / window, mode="same")
+    window = max(round(window_s * fs), 1)
+    integrated = np.convolve(
+        squared, np.ones(window) / window, mode="same"
+    )
 
     return {
         "input": ecg,
@@ -143,9 +147,9 @@ def pan_tompkins_threshold(
     """
     integrated = np.asarray(integrated, dtype=float)
     candidates, _ = scipy.signal.find_peaks(
-        integrated, distance=max(int(round(refractory_s * fs)), 1)
+        integrated, distance=max(round(refractory_s * fs), 1)
     )
-    learning = integrated[: max(int(round(learning_s * fs)), 1)]
+    learning = integrated[: max(round(learning_s * fs), 1)]
     spki = np.max(learning)
     npki = 0.5 * np.mean(learning)
     current = npki + 0.25 * (spki - npki)

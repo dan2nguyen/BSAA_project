@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-root_dir = Path(__file__).resolve().parent.parent
+root_dir = Path(__file__).resolve().parents[2]
 sys.path.append(str(root_dir))
 
 from databasing.pan_tompkins.detection import (
@@ -21,7 +21,7 @@ DEFAULT_EDF = (
     / "data"
     / "harmonized_ecg_ppg_database_filtered"
     / "wrist-finger-ppg"
-    / "25_0.edf"
+    / "01_4.edf"
 )
 DEFAULT_OUTPUT_DIR = root_dir / "data" / "plots"
 PLOT_KINDS = ["ecg_peaks", "hr", "pt_stages"]
@@ -74,8 +74,8 @@ def _zscore(x: np.ndarray) -> np.ndarray:
 
 def _slice_window(n_samples, fs, start_s, duration_s):
     """Returns (start, end) sample indices of a window clipped to the signal."""
-    start = min(max(int(round(start_s * fs)), 0), n_samples)
-    end = min(start + int(round(duration_s * fs)), n_samples)
+    start = min(max(round(start_s * fs), 0), n_samples)
+    end = min(start + round(duration_s * fs), n_samples)
     return start, end
 
 
