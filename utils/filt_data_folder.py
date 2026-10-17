@@ -92,7 +92,7 @@ def main():
                 info = mne.create_info(
                     ch_names=ch_names,
                     sfreq=fs,
-                    ch_types=["ecg", "misc"],
+                    ch_types=["misc", "misc"],
                 )
                 raw_filt = mne.io.RawArray(data, info)
 
