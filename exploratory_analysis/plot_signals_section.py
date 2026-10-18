@@ -414,7 +414,7 @@ def main():
 
     # 2. Load all sections from the new structure
     df_sections = load_evaluation_data(
-        r"references\evaluation_results.parquet"
+        r"databasing\references\evaluation_results.parquet"
     )
     if df_sections is None or df_sections.empty:
         print(
@@ -424,7 +424,7 @@ def main():
 
     # 3. Load corruption data for filtering and display
     df_corrupted = load_corrupted_data(
-        r"references\corrupted_sections.parquet"
+        r"databasing\references\corrupted_sections.parquet"
     )
 
     # 4. Filter sections if in random mode and filter is specified

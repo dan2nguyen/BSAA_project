@@ -191,7 +191,7 @@ def process_single_edf(task_info):
             file_results.append(row)
 
         return file_results, rel_path
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"Error processing {file}: {e}")
         return None, rel_path
 

@@ -92,12 +92,24 @@ def main():
                 info = mne.create_info(
                     ch_names=ch_names,
                     sfreq=fs,
-                    ch_types=["misc", "misc"],
+                    ch_types=["ecg", "misc"],
                 )
-                raw_filt = mne.io.RawArray(data, info)
-
-                # 3. Export: MNE multiplies 'ecg' by 1e6 back into uV for the EDF header
-                raw_filt.export(dst_path, fmt="edf", overwrite=True)
+                try:
+                    raw_filt = mne.io.RawArray(data, info)
+                    # 3. Export: MNE multiplies 'ecg' by 1e6 back into uV for the EDF header
+                    raw_filt.export(dst_path, fmt="edf", overwrite=True)
+                except Exception as e:
+                    if "exceeds maximum field length" in str(e):
+                        print(f"Field length error for {rel_path}, retrying with ch_types=['misc', 'misc']")
+                        info = mne.create_info(
+                            ch_names=ch_names,
+                            sfreq=fs,
+                            ch_types=["misc", "misc"],
+                        )
+                        raw_filt = mne.io.RawArray(data, info)
+                        raw_filt.export(dst_path, fmt="edf", overwrite=True)
+                    else:
+                        raise e
 
                 # Update progress CSV immediately after successful process
                 with open(progress_csv, "a", newline="") as f:
