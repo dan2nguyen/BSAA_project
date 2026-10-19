@@ -1,4 +1,5 @@
 import csv
+import gc
 import os
 import sys
 import tkinter as tk
@@ -7,6 +8,9 @@ from tkinter import filedialog
 
 import mne
 import numpy as np
+
+# Suppress verbose MNE logs
+mne.set_log_level("ERROR")
 
 root_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(root_dir))
@@ -20,9 +24,7 @@ def main():
     if len(sys.argv) > 1:
         source_folder = sys.argv[1]
         if not os.path.isdir(source_folder):
-            print(
-                f"Error: The provided path '{source_folder}' is not a valid directory."
-            )
+            print(f"Error: Path '{source_folder}' is not a directory.")
             sys.exit(1)
     else:
         root_tk = tk.Tk()
@@ -37,9 +39,7 @@ def main():
     # 2. Define Output Folder and Tracking
     output_root = "data/harmonized_ecg_ppg_database_filtered"
     progress_csv = os.path.join(output_root, "filtered_progress.csv")
-
-    if not os.path.exists(output_root):
-        os.makedirs(output_root)
+    os.makedirs(output_root, exist_ok=True)
 
     copied_files = set()
     if os.path.exists(progress_csv):
@@ -52,7 +52,6 @@ def main():
 
     # 3. Process Files
     count = 0
-
     for root, _, files in os.walk(source_folder):
         for filename in files:
             if not filename.endswith(".edf"):
@@ -65,65 +64,83 @@ def main():
                 continue
 
             dst_path = os.path.join(output_root, rel_path)
+            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+
             try:
-                os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-
-                # --- Filtering Process ---
-                # 1. Read the signals
+                # 1. Read signals
                 ecg, ppg, metadata = read_edf_signals(src_path)
+                if ecg is None or ppg is None:
+                    continue
 
-                # 2. Apply standard filters
                 fs = metadata.get("sampling_rate", 100.0)
-                f_ecg, f_ppg = apply_standard_filters(ecg, ppg, fs=fs)
 
-                # 3. Save filtered signals back to a new EDF file
+                # 2. Filter (avoid extra copies in memory)
+                f_ecg, f_ppg = apply_standard_filters(
+                    ecg.astype(np.float32, copy=False),
+                    ppg.astype(np.float32, copy=False),
+                    fs=fs,
+                )
+                del ecg, ppg
+
+                # 3. Preallocate array to avoid doubling RAM via vstack/np.array
+                min_len = min(len(f_ecg), len(f_ppg))
+                data = np.empty((2, min_len), dtype=np.float32)
+                data[0] = f_ecg[:min_len]
+                del f_ecg
+                data[1] = f_ppg[:min_len]
+                del f_ppg
+
                 ch_names = list(
                     metadata.get("channel_mapping", {}).values()
                 )
                 if len(ch_names) < 2:
                     ch_names = ["ECG", "PPG"]
 
-                data_ecg = f_ecg
-                data_ppg = f_ppg  # PPG stays raw/misc
-
-                data = np.vstack([data_ecg, data_ppg])
-
-                # 2. Tell MNE that channel 0 is ECG and channel 1 is misc
-                info = mne.create_info(
-                    ch_names=ch_names,
-                    sfreq=fs,
-                    ch_types=["ecg", "misc"],
-                )
+                # 4. Save to EDF
                 try:
-                    raw_filt = mne.io.RawArray(data, info)
-                    # 3. Export: MNE multiplies 'ecg' by 1e6 back into uV for the EDF header
+                    info = mne.create_info(
+                        ch_names=ch_names,
+                        sfreq=fs,
+                        ch_types=["ecg", "misc"],
+                    )
+                    raw_filt = mne.io.RawArray(
+                        data, info, verbose=False
+                    )
                     raw_filt.export(dst_path, fmt="edf", overwrite=True)
                 except Exception as e:
                     if "exceeds maximum field length" in str(e):
-                        print(f"Field length error for {rel_path}, retrying with ch_types=['misc', 'misc']")
                         info = mne.create_info(
                             ch_names=ch_names,
                             sfreq=fs,
                             ch_types=["misc", "misc"],
                         )
-                        raw_filt = mne.io.RawArray(data, info)
-                        raw_filt.export(dst_path, fmt="edf", overwrite=True)
+                        raw_filt = mne.io.RawArray(
+                            data, info, verbose=False
+                        )
+                        raw_filt.export(
+                            dst_path, fmt="edf", overwrite=True
+                        )
                     else:
                         raise e
+                finally:
+                    # Explicit cleanup for each file iteration
+                    del data
+                    if "raw_filt" in locals():
+                        del raw_filt
+                    gc.collect()
 
-                # Update progress CSV immediately after successful process
+                # Update progress
                 with open(progress_csv, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow([rel_path])
+                    csv.writer(f).writerow([rel_path])
 
                 count += 1
-                print(f"Processed and Filtered: {rel_path}")
-            except Exception as e:  # noqa: BLE001
-                print(f"Error processing {rel_path}: {e}")
+                print(f"Processed: {rel_path}")
 
-    print(
-        f"Successfully filtered and saved {count} new files to {output_root}"
-    )
+            except Exception as e:
+                print(f"Error {rel_path}: {e}")
+                gc.collect()
+
+    print(f"Done. Processed: {count}")
 
 
 if __name__ == "__main__":

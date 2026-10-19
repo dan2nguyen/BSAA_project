@@ -28,7 +28,7 @@ def apply_standard_filters(
     ecg_low=0.5,
     ecg_high=40.0,
     ppg_low=0.5,
-    ppg_high=5.0,
+    ppg_high=8.0,
     notch_freq=50.0,
 ):
     """Applies standard filtering chain to ECG and PPG signals."""
