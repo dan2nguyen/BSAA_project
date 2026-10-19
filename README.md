@@ -16,7 +16,34 @@ To add pip library to uv
 Project dscription
 <img width="1129" height="676" alt="image" src="https://github.com/user-attachments/assets/e342d970-db9f-4e0b-9e9b-57fd63340bd9" />
 
+## Database Filtering
 
+To ensure signal quality and remove noise (e.g., power line interferenc
+e), the database is filtered before further processing.
+
+### Filtering Scripts
+- `exploratory_analysis/filters.py`: Contains the filtering logic. The
+`apply_standard_filters` function applies:
+  - **ECG**: Notch filter at 50 Hz and a Butterworth bandpass filter (0
+.5–40 Hz).
+  - **PPG**: Butterworth bandpass filter (0.5–8 Hz).
+- `utils/filt_data_folder.py`: A utility to process entire database fol
+ders, apply the filters, and save the results as a new "filtered" datab
+ase in EDF format.
+
+### How to run filtration
+Run the following command from the repository root:
+```bash
+uv run python utils/filt_data_folder.py data/harmonized_ecg_ppg_databases
+```
+The results are saved to `data/harmonized_ecg_ppg_database_filtered/`.
+
+**Note:** To re-filter the data, delete the output folder or the `filte
+red_progress.csv` file first, as the script tracks progress to allow re
+suming interrupted runs.
+
+
+#
 
 # Pan-Tompkins HR and segment database (`databasing/pan_tompkins/`)
 
@@ -55,7 +82,6 @@ uv run python utils/filt_data_folder.py data/harmonized_ecg_ppg_databases
 ```
 
 - To re-filter, move or delete the old filtered folder first. Otherwise `filtered_progress.csv` marks every file as done and nothing is re-filtered.
-- With the current filter, 7 files in `wrist-finger-ppg` (`14_0`, `14_1`, `14_2`, `14_5`, `22_1`, `22_4`, `25_0`) cannot be exported to EDF and are missing from the filtered database.
 - The 4 files `multisite-ppg/P3_*_7.edf` are very long (about 1.4 GB each). Filtering them needs a lot of memory and can take about 30 minutes per file on a laptop with 8 GB RAM.
 
 ## HR for one file: `heart_rate.py`

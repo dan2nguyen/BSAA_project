@@ -121,7 +121,7 @@ def main():
                             dst_path, fmt="edf", overwrite=True
                         )
                     else:
-                        raise e
+                        raise e  # noqa: TRY201
                 finally:
                     # Explicit cleanup for each file iteration
                     del data
@@ -136,7 +136,7 @@ def main():
                 count += 1
                 print(f"Processed: {rel_path}")
 
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"Error {rel_path}: {e}")
                 gc.collect()
 
