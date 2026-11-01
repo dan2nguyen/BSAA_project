@@ -10,8 +10,7 @@ import torch
 from sklearn.model_selection import StratifiedGroupKFold
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-
-# Use tqdm for progress bars
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
 root_dir = Path(__file__).resolve().parent.parent
@@ -179,41 +178,20 @@ class SignalDataset(Dataset):
         )
 
         # Lazily load only the required segment
-        # We assume we use PPG for training (in_channels=1)
         _, ppg_segment, _ = read_edf_signals(
             edf_path,
             start_sample=row["start"],
             end_sample=row["end"],
         )
 
-        # if ppg_segment is None:
-        #     # Fallback for corrupted/missing files: return a zero vector
-        #     ppg_segment = np.zeros(500, dtype=np.float32)
-        # else:
-        #     # --- 1. Length Enforcement (Crop/Pad to 500) ---
-        #     target_len = 500
-        #     if len(ppg_segment) > target_len:
-        #         ppg_segment = ppg_segment[:target_len]
-        #     elif len(ppg_segment) < target_len:
-        #         ppg_segment = np.pad(
-        #             ppg_segment,
-        #             (0, target_len - len(ppg_segment)),
-        #             mode="constant",
-        #         )
-
-        # --- 2. Z-Score Normalization ---
-        # (x - mean) / (std + epsilon)
-        mean = np.mean(ppg_segment)
-        std = np.std(ppg_segment)
-        ppg_segment = (ppg_segment - mean) / (std + 1e-8)
+        if ppg_segment is None:
+            ppg_segment = np.zeros(500, dtype=np.float32)
 
         # Target: Exact HR value for regression
         label = row["hr_bpm"]
 
-        # Return as tensors (Shape: [1, Time])
-        signal_tensor = torch.tensor(
-            ppg_segment, dtype=torch.float32
-        ).unsqueeze(0)
+        # Return as tensors. Normalization is moved to GPU for speed.
+        signal_tensor = torch.from_numpy(ppg_segment).float().unsqueeze(0)
         label_tensor = torch.tensor(label, dtype=torch.float32)
 
         return signal_tensor, label_tensor
@@ -224,19 +202,28 @@ class SignalDataset(Dataset):
 # -----------------------------
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler):
     model.train()
     total_loss, total_error, total_acc, total = 0.0, 0.0, 0.0, 0
     # Wrap loader in tqdm for per-batch progress
     pbar = tqdm(loader, desc="  Training", leave=False)
     for x, y in pbar:
-        x, y = x.to(device), y.to(device)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        out = model(x)
-        loss = criterion(out, y)
-        loss.backward()
-        optimizer.step()
+        # GPU-based Normalization (Much faster than CPU)
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True)
+        x = (x - mean) / (std + 1e-8)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast():
+            out = model(x)
+            loss = criterion(out, y)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         batch_loss = loss.item()
         total_loss += batch_loss * len(y)
@@ -265,9 +252,16 @@ def evaluate(model, loader, criterion, device):
     # Wrap loader in tqdm for per-batch progress
     pbar = tqdm(loader, desc="  Evaluating", leave=False)
     for x, y in pbar:
-        x, y = x.to(device), y.to(device)
-        out = model(x)
-        loss = criterion(out, y)
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+        # GPU-based Normalization
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True)
+        x = (x - mean) / (std + 1e-8)
+
+        with autocast():
+            out = model(x)
+            loss = criterion(out, y)
 
         batch_loss = loss.item()
         total_loss += batch_loss * len(y)
@@ -415,18 +409,22 @@ def main():
         train_ds = SignalDataset(train_fold_df, args.edf_dir)
         val_ds = SignalDataset(val_fold_df, args.edf_dir)
 
-        # Use num_workers > 0 to parallelize EDF reading
+        # Optimized DataLoader
         train_loader = DataLoader(
             train_ds,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=4,
+            num_workers=os.cpu_count(),
+            pin_memory=True,
+            prefetch_factor=2,
         )
         val_loader = DataLoader(
             val_ds,
             batch_size=args.batch_size,
             shuffle=False,
-            num_workers=4,
+            num_workers=os.cpu_count(),
+            pin_memory=True,
+            prefetch_factor=2,
         )
 
         # Dynamic model instantiation
@@ -436,6 +434,7 @@ def main():
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=2
         )
+        scaler = GradScaler()
 
         # Create structured output directory
         output_dir = Path(
@@ -459,9 +458,9 @@ def main():
 
         for epoch in range(1, args.epochs + 1):
             t_loss, t_mae, t_acc = train_one_epoch(
-                model, train_loader, criterion, optimizer, device
+                model, train_loader, criterion, optimizer, device, scaler
             )
-            (v_loss, v_mae, v_acc), v_preds, v_targets = evaluate(
+            (v_loss, v_mae, v_acc), _, _ = evaluate(
                 model, val_loader, criterion, device
             )
 
