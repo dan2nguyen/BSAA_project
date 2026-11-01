@@ -191,3 +191,6 @@ db = pd.read_parquet("data/hr_database_seg10s_step5s.parquet")
 usable = db[~db.is_flat & db.hr_valid]
 train = usable[usable.split == "train"]
 ```
+
+You can now start the training using the following command:
+python prototyping_dan/training.py --db_path "data\hr_parts\seg10s_step5s" --edf_dir "data\harmonized_ecg_ppg_database_filtered" --hr_threshold 100
