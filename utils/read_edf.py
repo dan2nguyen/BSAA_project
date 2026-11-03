@@ -56,6 +56,9 @@ def read_edf_signals(
         return None, None, None
 
     ch_names = raw.ch_names
+    # mne requires an int start; None means "from the beginning"
+    if start_sample is None:
+        start_sample = 0
 
     def find_channel(keywords):
         matches = [

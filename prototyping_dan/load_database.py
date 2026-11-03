@@ -18,6 +18,7 @@ def load_parquet_files(
     folder_path: str,
     columns: list[str] | None = None,
     split_stats=False,
+    keep_source_info: bool = False,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Load Parquet files from subfolders and split them into train and test dataframes.
@@ -27,6 +28,8 @@ def load_parquet_files(
         folder_path (str): The path to the folder containing subfolders with Parquet files.
         columns (list[str] | None): List of columns to load.
         split_stats (bool): If True, prints the distribution of train/test samples.
+        keep_source_info (bool): If True, adds '_source_relpath' (parquet path relative
+                                 to folder_path) and '_source_row' (row position in that file).
 
     Returns:
         tuple[pd.DataFrame, pd.DataFrame]: (train_df, test_df)
@@ -64,6 +67,11 @@ def load_parquet_files(
 
                 # Store the filename to extract patient ID later
                 dataframe_filtered["_source_file"] = file
+                if keep_source_info:
+                    dataframe_filtered["_source_relpath"] = os.path.join(d, file)
+                    dataframe_filtered["_source_row"] = np.flatnonzero(
+                        condition.to_numpy()
+                    )
 
                 test_count += (
                     dataframe_filtered["split"] == "test"
@@ -102,17 +110,18 @@ def load_parquet_files(
     return train_df, test_df
 
 
+def extract_patient_id(filename: str) -> str:
+    """Extracts the patient ID prefix (e.g. 'P10', 's3', '01') from a file name."""
+    match = re.match(r"^(P\d+|s\d+|\d+)", filename)
+    if match:
+        return match.group(1)
+    return "unknown"
+
+
 def add_cv_groups(df: pd.DataFrame, n_folds: int = 5) -> pd.DataFrame:
     """
     Adds a 'cv_group' column to the dataframe based on patient IDs extracted from the source filename.
     """
-
-    def extract_patient_id(filename: str) -> str:
-        match = re.match(r"^(P\d+|s\d+|\d+)", filename)
-        if match:
-            return match.group(1)
-        return "unknown"
-
     df = df.copy()
     patient_ids = df["_source_file"].apply(extract_patient_id)
     patient_counts = patient_ids.value_counts()

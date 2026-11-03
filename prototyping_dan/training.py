@@ -202,6 +202,47 @@ class SignalDataset(Dataset):
 # -----------------------------
 
 
+def normalize_batch(x: torch.Tensor) -> torch.Tensor:
+    """Per-segment z-score normalization along the time axis."""
+    mean = x.mean(dim=-1, keepdim=True)
+    std = x.std(dim=-1, keepdim=True)
+    return (x - mean) / (std + 1e-8)
+
+
+def load_training_segments(
+    db_path: str, n_splits: int, keep_source_info: bool = False
+) -> pd.DataFrame:
+    """Loads the train-split segments and assigns patient-wise CV groups."""
+    train_df, _ = load_parquet_files(
+        db_path,
+        columns=[
+            "base_folder",
+            "edf_filename",
+            "start",
+            "end",
+            "hr_bpm",
+            "split",
+        ],
+        split_stats=True,
+        keep_source_info=keep_source_info,
+    )
+    return add_cv_groups(train_df, n_folds=n_splits)
+
+
+def make_cv_splits(
+    train_df: pd.DataFrame, n_splits: int
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Patient-wise stratified K-fold split; returns (train_idx, val_idx) per fold."""
+    # Create targets for StratifiedGroupKFold
+    y_cv = pd.qcut(train_df["hr_bpm"], q=5, labels=False)
+    groups_cv = train_df["cv_group"]
+
+    sgkf = StratifiedGroupKFold(
+        n_splits=n_splits, shuffle=True, random_state=42
+    )
+    return list(sgkf.split(train_df, y_cv, groups=groups_cv))
+
+
 def train_one_epoch(model, loader, criterion, optimizer, device, scaler):
     model.train()
     total_loss, total_error, total_acc, total = 0.0, 0.0, 0.0, 0
@@ -211,9 +252,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
         # GPU-based Normalization (Much faster than CPU)
-        mean = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True)
-        x = (x - mean) / (std + 1e-8)
+        x = normalize_batch(x)
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -255,9 +294,7 @@ def evaluate(model, loader, criterion, device):
         x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
         # GPU-based Normalization
-        mean = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True)
-        x = (x - mean) / (std + 1e-8)
+        x = normalize_batch(x)
 
         with autocast():
             out = model(x)
@@ -367,35 +404,14 @@ def main():
 
     # --- Load Real Data ---
     print(f"Loading database from {args.db_path}...")
-    train_df, _ = load_parquet_files(
-        args.db_path,
-        columns=[
-            "base_folder",
-            "edf_filename",
-            "start",
-            "end",
-            "hr_bpm",
-            "split",
-        ],
-        split_stats=True,
-    )
-
-    # Assign patient-wise CV groups
-    train_df = add_cv_groups(train_df, n_folds=args.n_splits)
-
-    # Create targets for StratifiedGroupKFold
-    y_cv = pd.qcut(train_df["hr_bpm"], q=5, labels=False)
-    groups_cv = train_df["cv_group"]
-
-    # --- Patient-Wise Stratified K-Fold ---
-    sgkf = StratifiedGroupKFold(
-        n_splits=args.n_splits, shuffle=True, random_state=42
-    )
+    # Train split with patient-wise CV groups
+    train_df = load_training_segments(args.db_path, args.n_splits)
 
     all_oof_dfs = []
 
+    # --- Patient-Wise Stratified K-Fold ---
     for fold, (train_idx, val_idx) in enumerate(
-        sgkf.split(train_df, y_cv, groups=groups_cv)
+        make_cv_splits(train_df, args.n_splits)
     ):
         print(
             f"\n========== Fold {fold + 1}/{args.n_splits} =========="

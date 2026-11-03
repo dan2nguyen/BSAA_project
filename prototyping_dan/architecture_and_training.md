@@ -31,10 +31,7 @@ A Convolutional Recurrent Neural Network (CRNN) that combines local feature extr
 ## 2. Signal Preprocessing Pipeline
 
 To ensure training stability and model generalization, every signal segment undergoes the following pipeline in the `SignalDataset`:
-1. **Length Enforcement**: Every segment is forced to a fixed length of **500 samples**.
-   - If too long: Cropped to the first 500.
-   - If too short: Zero-padded to reach 500.
-2. **Z-Score Normalization**: Per-segment normalization is applied: $x_{norm} = \frac{x - \mu}{\sigma + 1e-8}$.
+1. **Z-Score Normalization**: Per-segment normalization is applied: $x_{norm} = \frac{x - \mu}{\sigma + 1e-8}$.
    - This removes amplitude offsets and scaling differences between different patients or sensors.
 
 ---

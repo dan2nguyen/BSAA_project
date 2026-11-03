@@ -1,0 +1,601 @@
+import argparse
+import os
+import sys
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.model_selection import StratifiedGroupKFold
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from torch.cuda.amp import autocast, GradScaler
+from tqdm import tqdm
+
+root_dir = Path(__file__).resolve().parent.parent
+sys.path.append(str(root_dir))
+# Import database loading utilities
+from prototyping_dan.load_database import (
+    add_cv_groups,
+    load_parquet_files,
+)
+
+# Import the optimized EDF reader
+from utils.read_edf import read_edf_signals
+
+# -----------------------------
+# 1. Modular Architectures
+# -----------------------------
+
+
+class ResidualBlock(nn.Module):
+    def __init__(
+        self, in_channels, out_channels, kernel_size=3, stride=1
+    ):
+        super().__init__()
+        self.conv1 = nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride,
+            padding=kernel_size // 2,
+        )
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv1d(
+            out_channels,
+            out_channels,
+            kernel_size,
+            1,
+            padding=kernel_size // 2,
+        )
+        self.bn2 = nn.BatchNorm1d(out_channels)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, 1, stride),
+                nn.BatchNorm1d(out_channels),
+            )
+
+    def forward(self, x):
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        return self.relu(out)
+
+
+class SimpleCNN1D(nn.Module):
+    def __init__(self, in_channels=1):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_channels, 32, kernel_size=7, padding=3),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+        )
+        self.layer1 = ResidualBlock(32, 64)
+        self.layer2 = ResidualBlock(64, 128, stride=2)
+        self.layer3 = ResidualBlock(128, 256, stride=2)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(256, 1)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.pool(x).flatten(1)
+        return self.fc(x).squeeze(-1)
+
+
+class BiLSTM1D(nn.Module):
+    def __init__(
+        self,
+        in_channels=1,
+        hidden_dim=64,
+        num_layers=2,
+    ):
+        super().__init__()
+        # CRNN Architecture: CNN front-end for local feature extraction
+        self.cnn_frontend = nn.Sequential(
+            nn.Conv1d(
+                in_channels, 32, kernel_size=5, stride=1, padding=2
+            ),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, kernel_size=5, stride=1, padding=2),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+        )
+        # PyTorch LSTM expects (Batch, Seq_Len, Features)
+        self.lstm = nn.LSTM(
+            input_size=64,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+        )
+        self.fc = nn.Linear(hidden_dim * 2, 1)
+
+    def forward(self, x):
+        # 1. CNN extraction: (Batch, 1, Time) -> (Batch, 64, Time')
+        x = self.cnn_frontend(x)
+        # 2. Transpose for LSTM: (Batch, 64, Time') -> (Batch, Time', 64)
+        x = x.transpose(1, 2)
+        # 3. LSTM processing
+        out, _ = self.lstm(x)
+        # 4. Use final hidden state for regression
+        return self.fc(out[:, -1, :]).squeeze(-1)
+
+
+# -----------------------------
+# 2. Model Factory
+# -----------------------------
+
+MODEL_REGISTRY = {
+    "cnn1d": SimpleCNN1D,
+    "bilstm": BiLSTM1D,
+}
+
+
+def build_model(name: str, **kwargs) -> nn.Module:
+    if name not in MODEL_REGISTRY:
+        raise ValueError(
+            f"Unknown model '{name}'. Available: {list(MODEL_REGISTRY.keys())}"
+        )
+    return MODEL_REGISTRY[name](**kwargs)
+
+
+# -----------------------------
+# 3. Dataset Template
+# -----------------------------
+
+
+class SignalDataset(Dataset):
+    def __init__(self, df, base_dir):
+        """
+        Lazy-loading dataset for signal segments.
+
+        Args:
+            df (pd.DataFrame): DataFrame containing segment metadata.
+            base_dir (str): Base directory where EDF files are stored.
+        """
+        self.df = df.reset_index(drop=True)
+        self.base_dir = base_dir
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        # Construct full path to the EDF file
+        edf_path = os.path.join(
+            self.base_dir, row["base_folder"], row["edf_filename"]
+        )
+
+        # Lazily load only the required segment
+        _, ppg_segment, _ = read_edf_signals(
+            edf_path,
+            start_sample=row["start"],
+            end_sample=row["end"],
+        )
+
+        if ppg_segment is None:
+            ppg_segment = np.zeros(500, dtype=np.float32)
+
+        # Target: Exact HR value for regression
+        label = row["hr_bpm"]
+
+        # Return as tensors. Normalization is moved to GPU for speed.
+        signal_tensor = torch.from_numpy(ppg_segment).float().unsqueeze(0)
+        label_tensor = torch.tensor(label, dtype=torch.float32)
+
+        return signal_tensor, label_tensor
+
+
+# -----------------------------
+# 4. Train / Eval Steps
+# -----------------------------
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device, scaler):
+    model.train()
+    total_loss, total_error, total_acc, total = 0.0, 0.0, 0.0, 0
+    # Wrap loader in tqdm for per-batch progress
+    pbar = tqdm(loader, desc="  Training", leave=False)
+    for x, y in pbar:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+        # GPU-based Normalization (Much faster than CPU)
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True)
+        x = (x - mean) / (std + 1e-8)
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with autocast():
+            out = model(x)
+            loss = criterion(out, y)
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+
+        batch_loss = loss.item()
+        total_loss += batch_loss * len(y)
+        total_error += torch.abs(out - y).sum().item()
+
+        # Accuracy: % within 5 BPM
+        acc = (torch.abs(out - y) <= 5.0).float().mean().item()
+        total_acc += acc * len(y)
+
+        total += len(y)
+
+        # Update progress bar with current batch loss
+        pbar.set_postfix(
+            {"loss": f"{batch_loss:.4f}", "acc": f"{acc:.2%}"}
+        )
+
+    return total_loss / total, total_error / total, total_acc / total
+
+
+@torch.no_grad()
+def evaluate(model, loader, criterion, device):
+    model.eval()
+    total_loss, total_error, total_acc, total = 0.0, 0.0, 0.0, 0
+    all_preds = []
+    all_targets = []
+    # Wrap loader in tqdm for per-batch progress
+    pbar = tqdm(loader, desc="  Evaluating", leave=False)
+    for x, y in pbar:
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+
+        # GPU-based Normalization
+        mean = x.mean(dim=-1, keepdim=True)
+        std = x.std(dim=-1, keepdim=True)
+        x = (x - mean) / (std + 1e-8)
+
+        with autocast():
+            out = model(x)
+            loss = criterion(out, y)
+
+        batch_loss = loss.item()
+        total_loss += batch_loss * len(y)
+        total_error += torch.abs(out - y).sum().item()
+
+        # Accuracy: % within 5 BPM
+        acc = (torch.abs(out - y) <= 5.0).float().mean().item()
+        total_acc += acc * len(y)
+
+        total += len(y)
+
+        all_preds.append(out.cpu().numpy())
+        all_targets.append(y.cpu().numpy())
+
+        # Update progress bar with current batch loss
+        pbar.set_postfix(
+            {"loss": f"{batch_loss:.4f}", "acc": f"{acc:.2%}"}
+        )
+
+    metrics = (
+        total_loss / total,
+        total_error / total,
+        total_acc / total,
+    )
+    return (
+        metrics,
+        np.concatenate(all_preds).flatten(),
+        np.concatenate(all_targets).flatten(),
+    )
+
+
+def plot_learning_curves(history, save_path):
+    """Plots Train vs Val Loss, MAE, and Accuracy."""
+    _, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    metrics = [
+        ("loss", "MSE Loss"),
+        ("mae", "Mean Absolute Error (BPM)"),
+        ("acc", "Accuracy (within 5 BPM)"),
+    ]
+
+    for i, (key, label) in enumerate(metrics):
+        axes[i].plot(
+            history[f"train_{key}"], label="Train", color="blue"
+        )
+        axes[i].plot(history[f"val_{key}"], label="Val", color="red")
+        axes[i].set_title(label)
+        axes[i].set_xlabel("Epoch")
+        axes[i].set_ylabel("Value")
+        axes[i].legend()
+        axes[i].grid(True)
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+
+# -----------------------------
+# 5. Main Execution
+# -----------------------------
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Signal NN Training with Patient-Wise CV and Heart Rate Estimation"
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="cnn1d",
+        choices=list(MODEL_REGISTRY.keys()),
+    )
+    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--n_splits", type=int, default=5)
+
+    # Data paths
+    parser.add_argument(
+        "--db_path",
+        type=str,
+        required=True,
+        help="Path to Parquet files folder",
+    )
+    parser.add_argument(
+        "--edf_dir",
+        type=str,
+        required=True,
+        help="Root directory for EDF files",
+    )
+    parser.add_argument(
+        "--hr_threshold",
+        type=float,
+        default=100.0,
+        help="HR threshold for labels",
+    )
+
+    # CV fold selection
+    parser.add_argument(
+        "--folds",
+        type=str,
+        default="all",
+        help="Comma-separated list of fold numbers to use (e.g., '1,3,5'). "
+             "Use 'all' for all 5 folds. Specifies which CV groups to include "
+             "for training and evaluation.",
+    )
+
+    args = parser.parse_args()
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    # --- Load Real Data ---
+    print(f"Loading database from {args.db_path}...")
+    train_df, _ = load_parquet_files(
+        args.db_path,
+        columns=[
+            "base_folder",
+            "edf_filename",
+            "start",
+            "end",
+            "hr_bpm",
+            "split",
+            "is_flat",
+            "hr_valid",
+        ],
+        split_stats=True,
+    )
+
+    # Assign patient-wise CV groups
+    train_df = add_cv_groups(train_df, n_folds=args.n_splits)
+
+    # Determine which folds to use
+    if args.folds.lower() == "all":
+        selected_folds = list(range(1, args.n_splits + 1))
+    else:
+        selected_folds = [int(f.strip()) for f in args.folds.split(",")]
+
+    print(f"Using CV folds: {selected_folds}")
+
+    # Filter to only the selected folds
+    train_df_fold = train_df[train_df["cv_group"].isin(selected_folds)].reset_index(
+        drop=True
+    )
+    print(f"Total samples after fold filtering: {len(train_df_fold)}")
+    print(f"Fold distribution: {train_df_fold['cv_group'].value_counts().sort_index().to_dict()}")
+
+    # Create targets for StratifiedGroupKFold
+    y_cv = pd.qcut(train_df_fold["hr_bpm"], q=5, labels=False)
+    groups_cv = train_df_fold["cv_group"]
+
+    # --- Patient-Wise Stratified K-Fold ---
+    sgkf = StratifiedGroupKFold(
+        n_splits=args.n_splits, shuffle=True, random_state=42
+    )
+
+    all_oof_dfs = []
+    all_prediction_rows = []
+
+    for fold, (train_idx, val_idx) in enumerate(
+        sgkf.split(train_df_fold, y_cv, groups=groups_cv)
+    ):
+        # Only process selected folds
+        if (fold + 1) not in selected_folds:
+            print(
+                f"\n========== Fold {fold + 1}/{args.n_splits} =========="
+            )
+            print(f"Skipping fold {fold + 1} as it is not in selected folds.")
+            continue
+
+        print(
+            f"\n========== Fold {fold + 1}/{args.n_splits} =========="
+        )
+
+        # Sliced DataFrames for the current fold
+        train_fold_df = train_df_fold.iloc[train_idx]
+        val_fold_df = train_df_fold.iloc[val_idx]
+
+        # Lazy loading datasets
+        train_ds = SignalDataset(train_fold_df, args.edf_dir)
+        val_ds = SignalDataset(val_fold_df, args.edf_dir)
+
+        # Optimized DataLoader
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=os.cpu_count(),
+            pin_memory=True,
+            prefetch_factor=2,
+        )
+        val_loader = DataLoader(
+            val_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=os.cpu_count(),
+            pin_memory=True,
+            prefetch_factor=2,
+        )
+
+        # Dynamic model instantiation
+        model = build_model(args.model, in_channels=1).to(device)
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=2
+        )
+        scaler = GradScaler()
+
+        # Create structured output directory
+        output_dir = Path(
+            f"training_outputs/{args.model}/fold_{fold + 1}"
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        best_val_loss = float("inf")
+        patience_counter = 0
+        patience_limit = 5
+
+        # History tracking for plotting
+        history = {
+            "train_loss": [],
+            "train_mae": [],
+            "train_acc": [],
+            "val_loss": [],
+            "val_mae": [],
+            "val_acc": [],
+        }
+
+        for epoch in range(1, args.epochs + 1):
+            t_loss, t_mae, t_acc = train_one_epoch(
+                model, train_loader, criterion, optimizer, device, scaler
+            )
+            (v_loss, v_mae, v_acc), _, _ = evaluate(
+                model, val_loader, criterion, device
+            )
+
+            # Record history
+            history["train_loss"].append(t_loss)
+            history["train_mae"].append(t_mae)
+            history["train_acc"].append(t_acc)
+            history["val_loss"].append(v_loss)
+            history["val_mae"].append(v_mae)
+            history["val_acc"].append(v_acc)
+
+            # Scheduler step
+            scheduler.step(v_loss)
+
+            if v_loss < best_val_loss:
+                best_val_loss = v_loss
+                torch.save(
+                    model.state_dict(),
+                    output_dir / "best_model.pt",
+                )
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= patience_limit:
+                print(f"Early stopping triggered at epoch {epoch}")
+                break
+
+            print(
+                f"Epoch {epoch:02d} | Train MAE: {t_mae:.3f} Acc: {t_acc:.2%} | Val MAE: {v_mae:.3f} Acc: {v_acc:.2%} | Val Loss: {v_loss:.4f}"
+            )
+
+        # Save learning curves for the fold
+        plot_learning_curves(
+            history, output_dir / f"learning_curves_fold_{fold + 1}.png"
+        )
+
+        # OOF Collection: Load best model and get predictions for the fold
+        model.load_state_dict(torch.load(output_dir / "best_model.pt"))
+        (_, _, _), fold_preds, fold_targets = evaluate(
+            model, val_loader, criterion, device
+        )
+
+        # Get the rows corresponding to this fold's validation set
+        fold_val_indices = val_idx
+        fold_val_df = train_df_fold.iloc[fold_val_indices].reset_index(drop=True)
+
+        fold_results = pd.DataFrame(
+            {
+                "target_hr": fold_targets,
+                "predicted_hr": fold_preds,
+                "fold": fold + 1,
+            }
+        )
+
+        # Merge predictions back with the fold validation data to get all original flags
+        fold_val_with_preds = fold_val_df.merge(
+            fold_results, left_index=True, right_index=True
+        )
+
+        all_prediction_rows.append(fold_val_with_preds)
+        print(
+            f"Fold {fold + 1} complete. Model and plots saved to {output_dir}"
+        )
+
+    # --- Final OOF Summary ---
+    if all_prediction_rows:
+        full_prediction_df = pd.concat(all_prediction_rows, ignore_index=True)
+
+        # Define output path for the parquet file
+        folds_str = ",".join(str(f) for f in selected_folds)
+        oof_save_path = Path(
+            f"training_outputs/{args.model}/predictions_folds_{folds_str}.parquet"
+        )
+
+        # Save as parquet with all original flags + predicted HR
+        full_prediction_df.to_parquet(oof_save_path, index=False)
+
+        y_true = full_prediction_df["hr_bpm"]
+        y_pred = full_prediction_df["predicted_hr"]
+
+        mae = np.mean(np.abs(y_true - y_pred))
+        rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
+        acc = np.mean(np.abs(y_true - y_pred) <= 5.0)
+
+        print("\n" + "=" * 30)
+        print(f"FINAL CV SUMMARY ({args.model})")
+        print("=" * 30)
+        print(f"Selected CV folds: {folds_str}")
+        print(f"Overall MAE: {mae:.3f} BPM")
+        print(f"Overall RMSE: {rmse:.3f} BPM")
+        print(f"Overall Acc (±5 BPM): {acc:.2%}")
+        print(f"Predictions saved to: {oof_save_path}")
+        print(f"Total rows with predictions: {len(full_prediction_df)}")
+        print(f"Columns saved: {list(full_prediction_df.columns)}")
+        print("=" * 30)
+    else:
+        print("No folds were processed. Check your --folds argument.")
+
+
+if __name__ == "__main__":
+    main()
