@@ -1,16 +1,20 @@
 import argparse
+import hashlib
 import os
 import sys
+import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 from sklearn.model_selection import StratifiedGroupKFold
 from torch import nn
-from torch.utils.data import DataLoader, Dataset
-from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 
 root_dir = Path(__file__).resolve().parent.parent
@@ -67,6 +71,11 @@ class ResidualBlock(nn.Module):
 
 
 class SimpleCNN1D(nn.Module):
+    """
+    Original CNN. Receptive field is only 29 samples (0.29 s at 100 Hz),
+    i.e. shorter than one beat interval. Kept to load old checkpoints.
+    """
+
     def __init__(self, in_channels=1):
         super().__init__()
         self.stem = nn.Sequential(
@@ -87,6 +96,83 @@ class SimpleCNN1D(nn.Module):
         x = self.layer3(x)
         x = self.pool(x).flatten(1)
         return self.fc(x).squeeze(-1)
+
+
+class DilatedResidualBlock(nn.Module):
+    """Two dilated convolutions with a residual connection (same length)."""
+
+    def __init__(self, channels, dilation, kernel_size=3, dropout=0.1):
+        super().__init__()
+        padding = dilation * (kernel_size - 1) // 2
+        self.body = nn.Sequential(
+            nn.Conv1d(channels, channels, kernel_size, padding=padding,
+                      dilation=dilation, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Conv1d(channels, channels, kernel_size, padding=padding,
+                      dilation=dilation, bias=False),
+            nn.BatchNorm1d(channels),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        return self.relu(x + self.body(x))
+
+
+class DilatedCNN1D(nn.Module):
+    """
+    Residual CNN with exponentially growing dilation.
+
+    The stem halves the time resolution (100 Hz -> 50 Hz), then blocks with
+    dilations 1, 2, 4, ..., 64 give a receptive field of ~1030 samples,
+    i.e. every feature sees the whole 10 s window (6-30 beats), so the model
+    can use the beat-to-beat periodicity instead of counting local peaks.
+
+    The output is de-normalized (hr_mean + hr_std * head), so the network
+    learns a standardized target but returns HR in bpm like the other models.
+    """
+
+    def __init__(
+        self,
+        in_channels=1,
+        channels=64,
+        dilations=(1, 2, 4, 8, 16, 32, 64),
+        dropout=0.1,
+        hr_mean=80.0,
+        hr_std=20.0,
+    ):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv1d(in_channels, 32, kernel_size=7, stride=2, padding=3,
+                      bias=False),
+            nn.BatchNorm1d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv1d(32, channels, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(channels),
+            nn.ReLU(inplace=True),
+        )
+        self.blocks = nn.Sequential(
+            *[DilatedResidualBlock(channels, d, dropout=dropout)
+              for d in dilations]
+        )
+        self.head = nn.Sequential(
+            nn.Linear(2 * channels, 64),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1),
+        )
+        # Start from predicting hr_mean
+        nn.init.zeros_(self.head[-1].weight)
+        nn.init.zeros_(self.head[-1].bias)
+        self.register_buffer("hr_mean", torch.tensor(float(hr_mean)))
+        self.register_buffer("hr_std", torch.tensor(float(hr_std)))
+
+    def forward(self, x):
+        x = self.blocks(self.stem(x))
+        # Average + max pooling over time
+        x = torch.cat([x.mean(dim=-1), x.amax(dim=-1)], dim=1)
+        return self.hr_mean + self.hr_std * self.head(x).squeeze(-1)
 
 
 class BiLSTM1D(nn.Module):
@@ -136,6 +222,7 @@ class BiLSTM1D(nn.Module):
 # -----------------------------
 
 MODEL_REGISTRY = {
+    "dilated_cnn": DilatedCNN1D,
     "cnn1d": SimpleCNN1D,
     "bilstm": BiLSTM1D,
 }
@@ -150,55 +237,7 @@ def build_model(name: str, **kwargs) -> nn.Module:
 
 
 # -----------------------------
-# 3. Dataset Template
-# -----------------------------
-
-
-class SignalDataset(Dataset):
-    def __init__(self, df, base_dir):
-        """
-        Lazy-loading dataset for signal segments.
-
-        Args:
-            df (pd.DataFrame): DataFrame containing segment metadata.
-            base_dir (str): Base directory where EDF files are stored.
-        """
-        self.df = df.reset_index(drop=True)
-        self.base_dir = base_dir
-
-    def __len__(self):
-        return len(self.df)
-
-    def __getitem__(self, idx):
-        row = self.df.iloc[idx]
-
-        # Construct full path to the EDF file
-        edf_path = os.path.join(
-            self.base_dir, row["base_folder"], row["edf_filename"]
-        )
-
-        # Lazily load only the required segment
-        _, ppg_segment, _ = read_edf_signals(
-            edf_path,
-            start_sample=row["start"],
-            end_sample=row["end"],
-        )
-
-        if ppg_segment is None:
-            ppg_segment = np.zeros(500, dtype=np.float32)
-
-        # Target: Exact HR value for regression
-        label = row["hr_bpm"]
-
-        # Return as tensors. Normalization is moved to GPU for speed.
-        signal_tensor = torch.from_numpy(ppg_segment).float().unsqueeze(0)
-        label_tensor = torch.tensor(label, dtype=torch.float32)
-
-        return signal_tensor, label_tensor
-
-
-# -----------------------------
-# 4. Train / Eval Steps
+# 3. Data: segment selection and in-memory segment array
 # -----------------------------
 
 
@@ -243,91 +282,188 @@ def make_cv_splits(
     return list(sgkf.split(train_df, y_cv, groups=groups_cv))
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, scaler):
-    model.train()
-    total_loss, total_error, total_acc, total = 0.0, 0.0, 0.0, 0
-    # Wrap loader in tqdm for per-batch progress
-    pbar = tqdm(loader, desc="  Training", leave=False)
-    for x, y in pbar:
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+def _load_file_segments(task):
+    """
+    Worker: reads the PPG of one EDF file once and returns its segments,
+    z-scored like `normalize_batch`, as float16.
 
-        # GPU-based Normalization (Much faster than CPU)
-        x = normalize_batch(x)
+    Returns:
+        (row positions, segments [k, seg_len] float16, ok mask [k])
+    """
+    edf_path, rows, starts, ends, seg_len = task
+    segments = np.zeros((len(rows), seg_len), dtype=np.float16)
+    ok = np.zeros(len(rows), dtype=bool)
+    try:
+        _, ppg, _ = read_edf_signals(edf_path)
+    except Exception as e:  # noqa: BLE001
+        print(f"Error reading {edf_path}: {e}")
+        ppg = None
+    if ppg is None:
+        return rows, segments, ok
+
+    for k, (start, end) in enumerate(zip(starts, ends)):
+        seg = ppg[start:end].astype(np.float64)
+        if len(seg) != seg_len or not np.all(np.isfinite(seg)):
+            continue
+        seg = (seg - seg.mean()) / (seg.std(ddof=1) + 1e-8)
+        segments[k] = seg.astype(np.float16)
+        ok[k] = True
+    return rows, segments, ok
+
+
+def _segments_key(df: pd.DataFrame) -> str:
+    """Hash of the segment list, to check that a cache matches the rows."""
+    keys = df[["base_folder", "edf_filename", "start", "end"]]
+    return hashlib.md5(
+        pd.util.hash_pandas_object(keys, index=False).to_numpy().tobytes()
+    ).hexdigest()
+
+
+def load_segment_array(
+    df: pd.DataFrame,
+    edf_dir: str,
+    workers: int,
+    cache_dir: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Loads all segments of df into one array, reading every EDF file only once
+    (in parallel). Segments are z-scored per segment and stored as float16
+    (~2 KB per 10 s segment at 100 Hz).
+
+    Args:
+        df: Segment rows (base_folder, edf_filename, start, end).
+        edf_dir: Root folder of the EDF files.
+        workers: Number of parallel reader processes.
+        cache_dir: If given, the array is saved there and reused on the next
+            run with the same segment list.
+
+    Returns:
+        (segments [N, seg_len] float16, ok mask [N] bool)
+    """
+    seg_len = int((df["end"] - df["start"]).max())
+    key = _segments_key(df)
+    if cache_dir is not None:
+        cache_path = Path(cache_dir) / f"segments_{key}.npz"
+        if cache_path.exists():
+            print(f"Loading segment cache {cache_path}")
+            data = np.load(cache_path)
+            return data["segments"], data["ok"]
+
+    segments = np.zeros((len(df), seg_len), dtype=np.float16)
+    ok = np.zeros(len(df), dtype=bool)
+    starts, ends = df["start"].to_numpy(), df["end"].to_numpy()
+    # One task per EDF file; idx are row positions in df
+    groups = df.groupby(["base_folder", "edf_filename"]).indices
+    tasks = [
+        (os.path.join(edf_dir, folder, fname), idx, starts[idx], ends[idx],
+         seg_len)
+        for (folder, fname), idx in groups.items()
+    ]
+
+    t0 = time.perf_counter()
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        for rows, segs, file_ok in tqdm(
+            pool.map(_load_file_segments, tasks),
+            total=len(tasks), desc="Reading EDF files", unit="file",
+        ):
+            segments[rows] = segs
+            ok[rows] = file_ok
+    print(
+        f"Loaded {ok.sum()}/{len(df)} segments from {len(tasks)} files in"
+        f" {time.perf_counter() - t0:.0f} s ({segments.nbytes / 1e9:.2f} GB)"
+    )
+
+    if cache_dir is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(cache_path, segments=segments, ok=ok)
+        print(f"Saved segment cache to {cache_path}")
+    return segments, ok
+
+
+# -----------------------------
+# 4. Train / Eval Steps
+# -----------------------------
+
+
+def autocast_ctx(device: torch.device):
+    """Mixed precision (fp16) on CUDA, no-op on CPU."""
+    return torch.autocast(
+        device_type=device.type,
+        dtype=torch.float16,
+        enabled=device.type == "cuda",
+    )
+
+
+def iterate_batches(idx: torch.Tensor, batch_size: int, shuffle: bool):
+    """Yields index batches (on the device of idx)."""
+    if shuffle:
+        idx = idx[torch.randperm(len(idx), device=idx.device)]
+    for i in range(0, len(idx), batch_size):
+        yield idx[i : i + batch_size]
+
+
+def get_batch(X, y, batch_idx, device):
+    """Gathers a batch from the in-memory arrays -> ([B, 1, T] fp32, [B])."""
+    xb = X[batch_idx.to(X.device)].to(device, non_blocking=True)
+    yb = y[batch_idx.to(y.device)].to(device, non_blocking=True)
+    # Segments are already z-scored; fp16 -> fp32 for the model input
+    return xb.float().unsqueeze(1), yb
+
+
+def train_one_epoch(model, X, y, idx, batch_size, criterion, optimizer,
+                    device, scaler):
+    model.train()
+    # Metrics are accumulated on the GPU, synced once per epoch
+    sums = torch.zeros(3, device=device)  # loss*n, abs error, within 5 bpm
+    n_batches = (len(idx) + batch_size - 1) // batch_size
+    pbar = tqdm(iterate_batches(idx, batch_size, shuffle=True),
+                total=n_batches, desc="  Training", leave=False)
+    for step, batch_idx in enumerate(pbar):
+        xb, yb = get_batch(X, y, batch_idx, device)
 
         optimizer.zero_grad(set_to_none=True)
-
-        with autocast():
-            out = model(x)
-            loss = criterion(out, y)
+        with autocast_ctx(device):
+            out = model(xb)
+        out = out.float()
+        loss = criterion(out, yb)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
 
-        batch_loss = loss.item()
-        total_loss += batch_loss * len(y)
-        total_error += torch.abs(out - y).sum().item()
+        with torch.no_grad():
+            err = (out - yb).abs()
+            sums += torch.stack(
+                [loss.detach() * len(yb), err.sum(), (err <= 5.0).sum()]
+            )
+        if step % 50 == 0:
+            pbar.set_postfix({"loss": f"{loss.item():.2f}"})
 
-        # Accuracy: % within 5 BPM
-        acc = (torch.abs(out - y) <= 5.0).float().mean().item()
-        total_acc += acc * len(y)
-
-        total += len(y)
-
-        # Update progress bar with current batch loss
-        pbar.set_postfix(
-            {"loss": f"{batch_loss:.4f}", "acc": f"{acc:.2%}"}
-        )
-
-    return total_loss / total, total_error / total, total_acc / total
+    loss_sum, err_sum, acc_sum = sums.tolist()
+    n = len(idx)
+    return loss_sum / n, err_sum / n, acc_sum / n
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(model, X, y, idx, batch_size, criterion, device):
     model.eval()
-    total_loss, total_error, total_acc, total = 0.0, 0.0, 0.0, 0
-    all_preds = []
-    all_targets = []
-    # Wrap loader in tqdm for per-batch progress
-    pbar = tqdm(loader, desc="  Evaluating", leave=False)
-    for x, y in pbar:
-        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
+    preds = []
+    for batch_idx in tqdm(iterate_batches(idx, batch_size, shuffle=False),
+                          total=(len(idx) + batch_size - 1) // batch_size,
+                          desc="  Evaluating", leave=False):
+        xb, _ = get_batch(X, y, batch_idx, device)
+        with autocast_ctx(device):
+            preds.append(model(xb).float())
+    preds = torch.cat(preds)
+    targets = y[idx.to(y.device)].to(device)
 
-        # GPU-based Normalization
-        x = normalize_batch(x)
-
-        with autocast():
-            out = model(x)
-            loss = criterion(out, y)
-
-        batch_loss = loss.item()
-        total_loss += batch_loss * len(y)
-        total_error += torch.abs(out - y).sum().item()
-
-        # Accuracy: % within 5 BPM
-        acc = (torch.abs(out - y) <= 5.0).float().mean().item()
-        total_acc += acc * len(y)
-
-        total += len(y)
-
-        all_preds.append(out.cpu().numpy())
-        all_targets.append(y.cpu().numpy())
-
-        # Update progress bar with current batch loss
-        pbar.set_postfix(
-            {"loss": f"{batch_loss:.4f}", "acc": f"{acc:.2%}"}
-        )
-
+    err = (preds - targets).abs()
     metrics = (
-        total_loss / total,
-        total_error / total,
-        total_acc / total,
+        criterion(preds, targets).item(),
+        err.mean().item(),
+        (err <= 5.0).float().mean().item(),
     )
-    return (
-        metrics,
-        np.concatenate(all_preds).flatten(),
-        np.concatenate(all_targets).flatten(),
-    )
+    return metrics, preds.cpu().numpy(), targets.cpu().numpy()
 
 
 def plot_learning_curves(history, save_path):
@@ -335,7 +471,7 @@ def plot_learning_curves(history, save_path):
     _, axes = plt.subplots(1, 3, figsize=(18, 5))
 
     metrics = [
-        ("loss", "MSE Loss"),
+        ("loss", "Loss"),
         ("mae", "Mean Absolute Error (BPM)"),
         ("acc", "Accuracy (within 5 BPM)"),
     ]
@@ -368,13 +504,27 @@ def main():
     parser.add_argument(
         "--model",
         type=str,
-        default="cnn1d",
+        default="dilated_cnn",
         choices=list(MODEL_REGISTRY.keys()),
     )
     parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--loss",
+        choices=["mse", "huber"],
+        default="mse",
+        help="huber is less sensitive to wrong labels (delta = 5 bpm)",
+    )
     parser.add_argument("--n_splits", type=int, default=5)
+    parser.add_argument(
+        "--folds",
+        type=str,
+        default="all",
+        help="1-based folds to train, e.g. '1' or '1,2' (data split unchanged)",
+    )
+    parser.add_argument("--patience", type=int, default=5)
 
     # Data paths
     parser.add_argument(
@@ -390,22 +540,69 @@ def main():
         help="Root directory for EDF files",
     )
     parser.add_argument(
-        "--hr_threshold",
-        type=float,
-        default=100.0,
-        help="HR threshold for labels",
+        "--output_dir",
+        type=str,
+        default="training_outputs",
+        help="Folder for checkpoints, curves and OOF predictions",
     )
+    parser.add_argument(
+        "--cache_dir",
+        type=str,
+        default=None,
+        help="Folder to cache the loaded segments (reused on the next run)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=os.cpu_count(),
+        help="Processes for reading the EDF files",
+    )
+    parser.add_argument(
+        "--data_on_cpu",
+        action="store_true",
+        help="Keep the segment array in CPU RAM instead of GPU memory",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the model (needs a GPU with compute capability >= 7.0)",
+    )
+    parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
 
+    torch.manual_seed(args.seed)
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
 
     # --- Load Real Data ---
     print(f"Loading database from {args.db_path}...")
     # Train split with patient-wise CV groups
     train_df = load_training_segments(args.db_path, args.n_splits)
+
+    # --- Load all segments once into memory ---
+    segments, ok = load_segment_array(
+        train_df, args.edf_dir, args.workers, args.cache_dir
+    )
+    store = torch.device("cpu") if args.data_on_cpu else device
+    X = torch.from_numpy(segments).to(store)
+    if store.type == "cpu" and device.type == "cuda":
+        X = X.pin_memory()
+    y = torch.tensor(train_df["hr_bpm"].to_numpy(), dtype=torch.float32,
+                     device=store)
+    del segments
+    if not ok.all():
+        print(f"Warning: {int((~ok).sum())} segments could not be loaded"
+              " and are skipped")
+
+    if args.folds.lower() == "all":
+        selected_folds = set(range(1, args.n_splits + 1))
+    else:
+        selected_folds = {int(f) for f in args.folds.split(",")}
 
     all_oof_dfs = []
 
@@ -413,54 +610,41 @@ def main():
     for fold, (train_idx, val_idx) in enumerate(
         make_cv_splits(train_df, args.n_splits)
     ):
+        if fold + 1 not in selected_folds:
+            continue
         print(
             f"\n========== Fold {fold + 1}/{args.n_splits} =========="
         )
 
-        # Sliced DataFrames for the current fold
-        train_fold_df = train_df.iloc[train_idx]
-        val_fold_df = train_df.iloc[val_idx]
-
-        # Lazy loading datasets
-        train_ds = SignalDataset(train_fold_df, args.edf_dir)
-        val_ds = SignalDataset(val_fold_df, args.edf_dir)
-
-        # Optimized DataLoader
-        train_loader = DataLoader(
-            train_ds,
-            batch_size=args.batch_size,
-            shuffle=True,
-            num_workers=os.cpu_count(),
-            pin_memory=True,
-            prefetch_factor=2,
-        )
-        val_loader = DataLoader(
-            val_ds,
-            batch_size=args.batch_size,
-            shuffle=False,
-            num_workers=os.cpu_count(),
-            pin_memory=True,
-            prefetch_factor=2,
-        )
+        # Indices of loadable segments, kept on the device of the data
+        train_idx = train_idx[ok[train_idx]]
+        val_idx = val_idx[ok[val_idx]]
+        tr = torch.from_numpy(train_idx).to(store)
+        va = torch.from_numpy(val_idx).to(store)
+        print(f"Train segments: {len(tr)}, val segments: {len(va)}")
 
         # Dynamic model instantiation
         model = build_model(args.model, in_channels=1).to(device)
-        criterion = nn.MSELoss()
-        optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+        train_model = torch.compile(model) if args.compile else model
+        criterion = (
+            nn.HuberLoss(delta=5.0) if args.loss == "huber" else nn.MSELoss()
+        )
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode="min", factor=0.5, patience=2
         )
-        scaler = GradScaler()
+        scaler = torch.amp.GradScaler(
+            device.type, enabled=device.type == "cuda"
+        )
 
         # Create structured output directory
-        output_dir = Path(
-            f"training_outputs/{args.model}/fold_{fold + 1}"
-        )
+        output_dir = Path(args.output_dir) / args.model / f"fold_{fold + 1}"
         output_dir.mkdir(parents=True, exist_ok=True)
 
         best_val_loss = float("inf")
         patience_counter = 0
-        patience_limit = 5
 
         # History tracking for plotting
         history = {
@@ -473,11 +657,13 @@ def main():
         }
 
         for epoch in range(1, args.epochs + 1):
+            t0 = time.perf_counter()
             t_loss, t_mae, t_acc = train_one_epoch(
-                model, train_loader, criterion, optimizer, device, scaler
+                train_model, X, y, tr, args.batch_size, criterion,
+                optimizer, device, scaler,
             )
             (v_loss, v_mae, v_acc), _, _ = evaluate(
-                model, val_loader, criterion, device
+                train_model, X, y, va, args.batch_size, criterion, device
             )
 
             # Record history
@@ -491,8 +677,17 @@ def main():
             # Scheduler step
             scheduler.step(v_loss)
 
+            print(
+                f"Epoch {epoch:02d} | Train MAE: {t_mae:.3f} Acc: {t_acc:.2%}"
+                f" | Val MAE: {v_mae:.3f} Acc: {v_acc:.2%}"
+                f" | Val Loss: {v_loss:.4f}"
+                f" | lr {optimizer.param_groups[0]['lr']:.1e}"
+                f" | {time.perf_counter() - t0:.0f} s"
+            )
+
             if v_loss < best_val_loss:
                 best_val_loss = v_loss
+                # Uncompiled module, so the checkpoint loads anywhere
                 torch.save(
                     model.state_dict(),
                     output_dir / "best_model.pt",
@@ -501,13 +696,9 @@ def main():
             else:
                 patience_counter += 1
 
-            if patience_counter >= patience_limit:
+            if patience_counter >= args.patience:
                 print(f"Early stopping triggered at epoch {epoch}")
                 break
-
-            print(
-                f"Epoch {epoch:02d} | Train MAE: {t_mae:.3f} Acc: {t_acc:.2%} | Val MAE: {v_mae:.3f} Acc: {v_acc:.2%} | Val Loss: {v_loss:.4f}"
-            )
 
         # Save learning curves for the fold
         plot_learning_curves(
@@ -515,18 +706,19 @@ def main():
         )
 
         # OOF Collection: Load best model and get predictions for the fold
-        model.load_state_dict(torch.load(output_dir / "best_model.pt"))
+        model.load_state_dict(
+            torch.load(output_dir / "best_model.pt", map_location=device)
+        )
         (_, _, _), fold_preds, fold_targets = evaluate(
-            model, val_loader, criterion, device
+            model, X, y, va, args.batch_size, criterion, device
         )
 
-        fold_results = pd.DataFrame(
-            {
-                "target_hr": fold_targets,
-                "predicted_hr": fold_preds,
-                "fold": fold + 1,
-            }
-        )
+        fold_results = train_df.iloc[val_idx][
+            ["base_folder", "edf_filename", "start", "end", "cv_group"]
+        ].reset_index(drop=True)
+        fold_results["target_hr"] = fold_targets
+        fold_results["predicted_hr"] = fold_preds
+        fold_results["fold"] = fold + 1
         all_oof_dfs.append(fold_results)
         print(
             f"Fold {fold + 1} complete. Model and plots saved to {output_dir}"
@@ -535,8 +727,9 @@ def main():
     # --- Final OOF Summary ---
     if all_oof_dfs:
         oof_df = pd.concat(all_oof_dfs, ignore_index=True)
-        oof_save_path = Path(
-            f"training_outputs/{args.model}/oof_predictions_{args.model}.csv"
+        oof_save_path = (
+            Path(args.output_dir) / args.model
+            / f"oof_predictions_{args.model}.csv"
         )
         oof_df.to_csv(oof_save_path, index=False)
 

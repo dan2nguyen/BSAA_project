@@ -228,6 +228,7 @@ data
 planning
 side_scripts
 references\evaluation_results.parquet
+playground
 
 
 # macOS system files
