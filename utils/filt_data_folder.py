@@ -117,8 +117,15 @@ def main():
                         raw_filt = mne.io.RawArray(
                             data, info, verbose=False
                         )
+                        # Both channels are "misc" now; a per-channel
+                        # range keeps the ECG resolution (with the
+                        # default range per channel type, ECG would get
+                        # the much larger PPG range)
                         raw_filt.export(
-                            dst_path, fmt="edf", overwrite=True
+                            dst_path,
+                            fmt="edf",
+                            physical_range="channelwise",
+                            overwrite=True,
                         )
                     else:
                         raise e  # noqa: TRY201
