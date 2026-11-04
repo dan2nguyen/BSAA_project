@@ -5,7 +5,8 @@ Analyzes per-segment HR prediction errors produced by
 Outputs (in --report-dir):
     report.md, metrics_overall.csv, metrics_boolean.csv,
     metrics_categorical.csv, metrics_numerical_bins.csv,
-    metrics_numerical_spearman.csv, metrics_per_signal.csv,
+    metrics_numerical_spearman.csv, metrics_numerical_borders.csv,
+    metrics_per_signal.csv,
     metrics_per_subject.csv, figures/*.png
 """
 
@@ -42,6 +43,7 @@ DEFAULT_EXCLUDE = {
     "hr_pred",
     "hr_error",
     "hr_abs_error",
+    "hr_rel_error",
     "cv_role",
     "model_fold",
     "model_path",
@@ -66,19 +68,28 @@ def load_predictions(pred_dirs: list[str]) -> pd.DataFrame:
     )
 
 
-def error_metrics(err: pd.Series) -> dict[str, float]:
-    """N, MAE, RMSE, bias and share within ±5 bpm of signed errors in bpm."""
+def error_metrics(
+    err: pd.Series, rel: pd.Series | None = None
+) -> dict[str, float]:
+    """
+    N, MAE, RMSE, bias and share within ±5 bpm of signed errors in bpm;
+    with rel (|error| / HR_true in %) also the mean relative error MAPE.
+    """
     err = err.dropna()
     if len(err) == 0:
-        return {"n": 0, "mae": np.nan, "rmse": np.nan, "bias": np.nan,
-                "acc_5bpm": np.nan}
-    return {
-        "n": int(len(err)),
-        "mae": float(err.abs().mean()),
-        "rmse": float(np.sqrt((err**2).mean())),
-        "bias": float(err.mean()),
-        "acc_5bpm": float((err.abs() <= 5).mean()),
-    }
+        out = {"n": 0, "mae": np.nan, "rmse": np.nan, "bias": np.nan,
+               "acc_5bpm": np.nan}
+    else:
+        out = {
+            "n": int(len(err)),
+            "mae": float(err.abs().mean()),
+            "rmse": float(np.sqrt((err**2).mean())),
+            "bias": float(err.mean()),
+            "acc_5bpm": float((err.abs() <= 5).mean()),
+        }
+    if rel is not None:
+        out["mape"] = float(rel.mean()) if len(rel) else np.nan
+    return out
 
 
 def grouped_metrics(df: pd.DataFrame, by: list[str]) -> pd.DataFrame:
@@ -168,24 +179,89 @@ def analyze_categorical(df: pd.DataFrame, flags: list[str]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def keep_rule(col: str, lower: float, upper: float) -> str:
+    """Human-readable rule for the kept range, e.g. '0.2 < x <= 3.1'."""
+    if np.isnan(lower) and np.isnan(upper):
+        return "keep all"
+    if np.isnan(lower):
+        return f"{col} <= {upper:.4g}"
+    if np.isnan(upper):
+        return f"{col} > {lower:.4g}"
+    return f"{lower:.4g} < {col} <= {upper:.4g}"
+
+
+def find_border(
+    table: pd.DataFrame, sub: pd.DataFrame, col: str, limit: float
+) -> dict:
+    """
+    Suggests the acceptable range of a metric for a relative-error limit.
+
+    The acceptable range is the contiguous run of quantile bins with
+    MAPE <= limit that contains the best bin. Its edges are the borders:
+    'lower' if bins below it exceed the limit, 'upper' if bins above do.
+
+    Returns:
+        Row with the borders and the errors of kept / rejected segments.
+    """
+    mape = table["mape"].to_numpy()
+    best = int(np.nanargmin(mape))
+    row = {"flag": col, "best_bin_mape": mape[best]}
+    if mape[best] > limit:
+        return {**row, "status": f"no bin with MAPE <= {limit:g} %"}
+
+    lo = best
+    while lo > 0 and mape[lo - 1] <= limit:
+        lo -= 1
+    hi = best
+    while hi < len(mape) - 1 and mape[hi + 1] <= limit:
+        hi += 1
+
+    lower = float(table["bin_left"].iloc[lo]) if lo > 0 else np.nan
+    upper = float(table["bin_right"].iloc[hi]) if hi < len(mape) - 1 else np.nan
+    x = sub[col].to_numpy()
+    keep = np.ones(len(sub), dtype=bool)
+    if not np.isnan(lower):
+        keep &= x > lower
+    if not np.isnan(upper):
+        keep &= x <= upper
+
+    kept = error_metrics(sub.loc[keep, "hr_error"], sub.loc[keep, "hr_rel_error"])
+    rej = error_metrics(sub.loc[~keep, "hr_error"], sub.loc[~keep, "hr_rel_error"])
+    no_border = np.isnan(lower) and np.isnan(upper)
+    return {
+        **row,
+        "status": "no border needed" if no_border else "border suggested",
+        "lower_border": lower,
+        "upper_border": upper,
+        "keep_rule": keep_rule(col, lower, upper),
+        "kept_share": keep.mean(),
+        "kept_mae": kept["mae"],
+        "kept_mape": kept["mape"],
+        "rejected_mae": rej["mae"],
+        "rejected_mape": rej["mape"],
+    }
+
+
 def analyze_numerical(
     df: pd.DataFrame,
     flags: list[str],
     n_bins: int,
     fig_dir: Path,
     max_scatter: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    error_limit: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    Quantile-binned error table, Spearman correlation and a figure per flag.
+    Quantile-binned error table, Spearman correlation, suggested border
+    for the relative-error limit and a figure per flag.
 
     Returns:
-        (bins table, spearman table)
+        (bins table, spearman table, borders table)
     """
-    bin_rows, corr_rows = [], []
+    bin_rows, corr_rows, border_rows = [], [], []
     rng = np.random.default_rng(0)
 
     for col in flags:
-        sub = df[[col, "hr_error", "hr_abs_error"]].dropna()
+        sub = df[[col, "hr_error", "hr_abs_error", "hr_rel_error"]].dropna()
         if sub[col].nunique() < 2:
             continue
 
@@ -204,18 +280,28 @@ def analyze_numerical(
                     "bin_left": interval.left,
                     "bin_right": interval.right,
                     "x_median": g[col].median(),
-                    **error_metrics(g["hr_error"]),
+                    **error_metrics(g["hr_error"], g["hr_rel_error"]),
                 }
             )
         bin_rows.extend(table)
+        table = pd.DataFrame(table)
+        border = find_border(table, sub, col, error_limit)
+        border_rows.append(border)
         plot_numerical_flag(
-            sub, col, pd.DataFrame(table), rho, fig_dir, max_scatter, rng
+            sub, col, table, rho, border, error_limit, fig_dir,
+            max_scatter, rng,
         )
 
     corr = pd.DataFrame(corr_rows)
     if len(corr):
         corr = corr.sort_values("spearman_rho", ascending=False, key=np.abs)
-    return pd.DataFrame(bin_rows), corr
+    borders = pd.DataFrame(border_rows)
+    if "kept_mape" in borders:
+        # Most useful first: biggest relative-error gap rejected vs kept
+        gap = borders["rejected_mape"] - borders["kept_mape"]
+        borders = borders.iloc[np.argsort(-gap.fillna(-np.inf).to_numpy(),
+                                          kind="stable")]
+    return pd.DataFrame(bin_rows), corr, borders
 
 
 def plot_numerical_flag(
@@ -223,16 +309,26 @@ def plot_numerical_flag(
     col: str,
     table: pd.DataFrame,
     rho: float,
+    border: dict,
+    error_limit: float,
     fig_dir: Path,
     max_scatter: int,
     rng: np.random.Generator,
 ) -> None:
-    """Scatter of flag vs |error| and signed error with binned curves."""
+    """
+    Scatter of flag vs |error| and signed error with binned curves, and
+    binned relative error (MAPE) with the limit and the suggested borders.
+    """
     pts = sub
     if len(sub) > max_scatter:
         pts = sub.iloc[rng.choice(len(sub), max_scatter, replace=False)]
+    # Long tails (e.g. kurtosis) would squeeze the plots: show 0.5-99.5 %
+    x_lo, x_hi = np.nanpercentile(sub[col], [0.5, 99.5])
+    if x_lo == x_hi:
+        x_lo, x_hi = sub[col].min(), sub[col].max()
+    pad = 0.02 * (x_hi - x_lo) or 1.0
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(1, 3, figsize=(21, 5))
 
     ax = axes[0]
     ax.scatter(pts[col], pts["hr_abs_error"], s=3, alpha=0.15, color="gray",
@@ -259,6 +355,30 @@ def plot_numerical_flag(
     ax.set_title(f"{col}: signed error")
     ax.grid(True, alpha=0.3)
     ax.legend()
+
+    ax = axes[2]
+    ax.plot(table["x_median"], table["mape"], "o-", color="purple", lw=2,
+            label="MAPE per quantile bin")
+    ax.axhline(error_limit, color="red", ls="--", lw=1.2,
+               label=f"limit {error_limit:g} %")
+    for key in ["lower_border", "upper_border"]:
+        x = border.get(key, np.nan)
+        if not np.isnan(x):
+            ax.axvline(x, color="green", lw=2,
+                       label=f"{key.replace('_', ' ')} = {x:.4g}")
+    title = f"{col}: relative error\n{border.get('keep_rule', border['status'])}"
+    if "kept_share" in border:
+        title += (f"  (keeps {border['kept_share']:.1%}, "
+                  f"MAPE {border['kept_mape']:.2f} %)")
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel(col)
+    ax.set_ylabel("Mean |HR_pred - HR_true| / HR_true (%)")
+    ax.set_ylim(0, max(np.nanmax(table["mape"]), error_limit) * 1.15)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    for ax in axes:
+        ax.set_xlim(x_lo - pad, x_hi + pad)
 
     plt.tight_layout()
     plt.savefig(fig_dir / f"numerical_{col}.png", dpi=110)
@@ -333,7 +453,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report-dir", required=True)
     parser.add_argument("--flag-columns", nargs="+", default=None)
     parser.add_argument("--exclude-columns", nargs="+", default=[])
-    parser.add_argument("--n-bins", type=int, default=10)
+    parser.add_argument(
+        "--n-bins",
+        type=int,
+        default=20,
+        help="Quantile bins per numerical metric (curves and borders)",
+    )
+    parser.add_argument(
+        "--error-limit",
+        type=float,
+        default=5.0,
+        help="Relative error limit in %% (|HR_pred - HR_true| / HR_true) "
+        "used to suggest a border for each numerical metric",
+    )
     parser.add_argument(
         "--max-scatter-points",
         type=int,
@@ -356,16 +488,18 @@ def main() -> None:
     df = df[~failed].reset_index(drop=True)
     print(f"Loaded {n_total} segments, dropped {int(failed.sum())} with NaN hr_pred")
 
+    df["hr_rel_error"] = 100 * df["hr_abs_error"] / df["hr_bpm"]
     df["subject_id"] = df["base_folder"] + "/" + df["edf_filename"].map(
         extract_patient_id
     )
 
     # --- Overall ---
-    overall = [{"group": "all", "value": "all", **error_metrics(df["hr_error"])}]
+    overall = [{"group": "all", "value": "all",
+                **error_metrics(df["hr_error"], df["hr_rel_error"])}]
     for col in ["cv_role", "model_fold"]:
         for value, g in df.groupby(col, sort=True):
             overall.append({"group": col, "value": value,
-                            **error_metrics(g["hr_error"])})
+                            **error_metrics(g["hr_error"], g["hr_rel_error"])})
     if df["cv_role"].nunique() > 1 and df["model_fold"].nunique() > 1:
         for (fold, role), g in df.groupby(["model_fold", "cv_role"]):
             overall.append({"group": "model_fold/cv_role",
@@ -389,8 +523,9 @@ def main() -> None:
 
     bool_tab = analyze_boolean(df, boolean)
     cat_tab = analyze_categorical(df, categorical)
-    bins_tab, corr_tab = analyze_numerical(
-        df, numerical, args.n_bins, fig_dir, args.max_scatter_points
+    bins_tab, corr_tab, border_tab = analyze_numerical(
+        df, numerical, args.n_bins, fig_dir, args.max_scatter_points,
+        args.error_limit,
     )
 
     # --- Per signal / subject ---
@@ -407,6 +542,7 @@ def main() -> None:
     cat_tab.to_csv(report_dir / "metrics_categorical.csv", index=False)
     bins_tab.to_csv(report_dir / "metrics_numerical_bins.csv", index=False)
     corr_tab.to_csv(report_dir / "metrics_numerical_spearman.csv", index=False)
+    border_tab.to_csv(report_dir / "metrics_numerical_borders.csv", index=False)
     per_signal.to_csv(report_dir / "metrics_per_signal.csv", index=False)
     per_subject.to_csv(report_dir / "metrics_per_subject.csv", index=False)
 
@@ -418,7 +554,8 @@ def main() -> None:
     num_figs = "\n".join(
         f"### {c}\n\n![{c}](figures/numerical_{c}.png)\n\n"
         + md_table(bins_tab.loc[bins_tab.flag == c,
-                                ["bin", "x_median", "n", "mae", "rmse", "bias"]])
+                                ["bin", "x_median", "n", "mae", "rmse",
+                                 "bias", "mape"]])
         for c in corr_tab.get("flag", [])
     )
     sections = [
@@ -435,6 +572,12 @@ def main() -> None:
         ("Boolean flags (sorted by |MAE difference|, True − False)",
          md_table(bool_tab)),
         ("Categorical integer flags", md_table(cat_tab)),
+        (f"Numerical flags: suggested borders for {args.error_limit:g} % relative error",
+         "MAPE = mean of |HR_pred − HR_true| / HR_true. The kept range is the "
+         f"contiguous run of quantile bins with MAPE ≤ {args.error_limit:g} % "
+         "around the best bin; segments outside it are rejected. Sorted by "
+         "MAPE of rejected − kept segments (most useful metric first). Each "
+         "metric is evaluated on its own.\n\n" + md_table(border_tab)),
         ("Numerical flags: Spearman ρ (flag vs absolute error)",
          md_table(corr_tab) + "\n" + num_figs),
         ("Worst 30 signals (by MAE)",

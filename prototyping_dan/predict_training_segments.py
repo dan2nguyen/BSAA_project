@@ -34,6 +34,42 @@ STATUS_OK = "ok"
 
 
 # -----------------------------
+# 0. Model loading
+# -----------------------------
+
+
+def load_model(
+    model_path: str, model_name: str, device: torch.device
+) -> tuple[torch.nn.Module, str]:
+    """
+    Loads a checkpoint (state_dict saved by training.py).
+
+    With model_name == "auto" the architecture is detected from the
+    checkpoint keys by trying every model in MODEL_REGISTRY.
+
+    Returns:
+        (model in eval mode on device, name of the architecture)
+    """
+    state_dict = torch.load(model_path, map_location=device)
+    names = list(MODEL_REGISTRY) if model_name == "auto" else [model_name]
+
+    errors = {}
+    for name in names:
+        model = build_model(name, in_channels=1)
+        try:
+            model.load_state_dict(state_dict)
+        except RuntimeError as e:
+            errors[name] = str(e).splitlines()[0]
+            continue
+        return model.to(device).eval(), name
+
+    raise RuntimeError(
+        f"Checkpoint {model_path} does not match "
+        + ", ".join(f"{n} ({msg})" for n, msg in errors.items())
+    )
+
+
+# -----------------------------
 # 1. Segment selection
 # -----------------------------
 
@@ -294,13 +330,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--n-splits",
         type=int,
-        default=2,
+        default=5,
         help="Number of CV splits used in training (must match!)",
     )
     parser.add_argument(
         "--model",
-        default="cnn1d",
-        choices=list(MODEL_REGISTRY.keys()),
+        default="auto",
+        choices=["auto", *MODEL_REGISTRY.keys()],
+        help="Architecture of the checkpoint; 'auto' detects it",
     )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument(
@@ -324,6 +361,10 @@ def main() -> None:
 
     device = torch.device(args.device)
 
+    # Load the model first so a wrong checkpoint fails before data loading
+    model, model_name = load_model(args.model_path, args.model, device)
+    print(f"Model: {model_name} ({args.model_path})")
+
     print(f"Selecting fold {args.fold}/{args.n_splits} ({args.subset})...")
     selected = select_fold_segments(
         args.parquet_dir, args.n_splits, args.fold, args.subset
@@ -336,10 +377,6 @@ def main() -> None:
         f"Selected segments: {len(selected)} "
         f"{selected['cv_role'].value_counts().to_dict()}"
     )
-
-    model = build_model(args.model, in_channels=1)
-    model.load_state_dict(torch.load(args.model_path, map_location=device))
-    model.to(device).eval()
 
     hr_pred, status = run_inference(
         selected,
@@ -364,7 +401,7 @@ def main() -> None:
     # --- Summary ---
     failed = selected["hr_pred"].isna()
     print("\n" + "=" * 40)
-    print(f"Fold {args.fold} | subset={args.subset} | model={args.model}")
+    print(f"Fold {args.fold} | subset={args.subset} | model={model_name}")
     print(f"Segments: {len(selected)}  Failed: {int(failed.sum())}")
     if failed.any():
         reasons = Counter(selected.loc[failed, "pred_status"])
