@@ -249,22 +249,34 @@ def normalize_batch(x: torch.Tensor) -> torch.Tensor:
 
 
 def load_training_segments(
-    db_path: str, n_splits: int, keep_source_info: bool = False
+    db_path: str,
+    n_splits: int,
+    keep_source_info: bool = False,
+    target_col: str = "feasible_bpm",
 ) -> pd.DataFrame:
-    """Loads the train-split segments and assigns patient-wise CV groups."""
+    """
+    Loads the train-split segments and assigns patient-wise CV groups.
+
+    Only rows with a non-NaN target_col are kept, and 'hr_bpm' is replaced
+    by it, so everything downstream trains on target_col. With the default
+    'feasible_bpm' (see feasible_bpm.py) these are the segments inside the
+    ECG/PPG quality borders of the fold report.
+    """
+    columns = ["base_folder", "edf_filename", "start", "end", "hr_bpm",
+               "split"]
+    if target_col not in columns:
+        columns.append(target_col)
     train_df, _ = load_parquet_files(
         db_path,
-        columns=[
-            "base_folder",
-            "edf_filename",
-            "start",
-            "end",
-            "hr_bpm",
-            "split",
-        ],
+        columns=columns,
         split_stats=True,
         keep_source_info=keep_source_info,
     )
+    n_before = len(train_df)
+    train_df = train_df[train_df[target_col].notna()].reset_index(drop=True)
+    train_df["hr_bpm"] = train_df[target_col]
+    print(f"Target '{target_col}': kept {len(train_df)}/{n_before}"
+          f" train segments ({len(train_df) / max(n_before, 1):.1%})")
     return add_cv_groups(train_df, n_folds=n_splits)
 
 
@@ -280,6 +292,75 @@ def make_cv_splits(
         n_splits=n_splits, shuffle=True, random_state=42
     )
     return list(sgkf.split(train_df, y_cv, groups=groups_cv))
+
+
+def make_lds_weighter(
+    targets: np.ndarray,
+    alpha: float,
+    sigma: float,
+    max_weight: float,
+    bin_width: float = 1.0,
+):
+    """
+    Label distribution smoothing (Yang et al., 2021) for imbalanced
+    regression: the HR histogram of the training targets is smoothed with
+    a Gaussian, and each sample gets weight density(hr) ** -alpha
+    (alpha = 0.5: inverse square root, 1: inverse frequency).
+
+    Weights are normalized to mean 1 on `targets` and capped at max_weight,
+    so the loss scale and the learning rate stay comparable to unweighted
+    training.
+
+    Args:
+        targets: HR of the training samples (bpm), used for the density.
+        alpha: Strength of the reweighting.
+        sigma: Gaussian smoothing of the histogram in bpm.
+        max_weight: Upper cap of a weight (relative to the mean of 1).
+        bin_width: Histogram bin width in bpm.
+
+    Returns:
+        Function hr array -> weight array (also for HR outside the
+        training range, e.g. validation samples).
+    """
+    from scipy.ndimage import gaussian_filter1d
+
+    edges = np.arange(np.floor(targets.min()),
+                      np.ceil(targets.max()) + bin_width, bin_width)
+    counts, _ = np.histogram(targets, bins=edges)
+    density = gaussian_filter1d(counts.astype(np.float64),
+                                sigma / bin_width, mode="constant")
+    centers = (edges[:-1] + edges[1:]) / 2
+    floor = density[density > 0].min()
+
+    def raw(hr):
+        d = np.interp(hr, centers, density, left=floor, right=floor)
+        return np.maximum(d, floor) ** -alpha
+
+    scale = 1.0 / raw(targets).mean()
+    # Rescale once after capping so the mean is ~1 again
+    scale /= np.minimum(raw(targets) * scale, max_weight).mean()
+
+    def weigh(hr):
+        return np.minimum(raw(hr) * scale, max_weight).astype(np.float32)
+
+    return weigh
+
+
+def per_bin_errors(
+    targets: np.ndarray, preds: np.ndarray, width: float = 10.0
+) -> tuple[pd.DataFrame, float]:
+    """
+    MAE and bias per HR bin of the targets, and the balanced MAE (mean of
+    the per-bin MAEs), which weighs every HR range equally.
+    """
+    df = pd.DataFrame({"target": targets, "err": preds - targets})
+    df["bin"] = (np.floor(df["target"] / width) * width).astype(int)
+    table = df.groupby("bin").agg(
+        n=("err", "size"),
+        mae=("err", lambda e: e.abs().mean()),
+        bias=("err", "mean"),
+    )
+    return table, float(table["mae"].mean())
 
 
 def _load_file_segments(task):
@@ -410,8 +491,15 @@ def get_batch(X, y, batch_idx, device):
     return xb.float().unsqueeze(1), yb
 
 
+def weighted_loss(criterion, out, yb, wb):
+    """Mean of the per-sample loss, weighted by wb if given."""
+    loss = criterion(out, yb)
+    return (loss * wb).mean() if wb is not None else loss.mean()
+
+
 def train_one_epoch(model, X, y, idx, batch_size, criterion, optimizer,
-                    device, scaler):
+                    device, scaler, w=None):
+    """w: per-sample loss weights (same indexing as y) or None."""
     model.train()
     # Metrics are accumulated on the GPU, synced once per epoch
     sums = torch.zeros(3, device=device)  # loss*n, abs error, within 5 bpm
@@ -425,7 +513,9 @@ def train_one_epoch(model, X, y, idx, batch_size, criterion, optimizer,
         with autocast_ctx(device):
             out = model(xb)
         out = out.float()
-        loss = criterion(out, yb)
+        wb = (w[batch_idx.to(w.device)].to(device, non_blocking=True)
+              if w is not None else None)
+        loss = weighted_loss(criterion, out, yb, wb)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -445,7 +535,8 @@ def train_one_epoch(model, X, y, idx, batch_size, criterion, optimizer,
 
 
 @torch.no_grad()
-def evaluate(model, X, y, idx, batch_size, criterion, device):
+def evaluate(model, X, y, idx, batch_size, criterion, device, w=None):
+    """w: per-sample loss weights (same indexing as y) or None."""
     model.eval()
     preds = []
     for batch_idx in tqdm(iterate_batches(idx, batch_size, shuffle=False),
@@ -458,8 +549,9 @@ def evaluate(model, X, y, idx, batch_size, criterion, device):
     targets = y[idx.to(y.device)].to(device)
 
     err = (preds - targets).abs()
+    wv = w[idx.to(w.device)].to(device) if w is not None else None
     metrics = (
-        criterion(preds, targets).item(),
+        weighted_loss(criterion, preds, targets, wv).item(),
         err.mean().item(),
         (err <= 5.0).float().mean().item(),
     )
@@ -516,6 +608,28 @@ def main():
         choices=["mse", "huber"],
         default="mse",
         help="huber is less sensitive to wrong labels (delta = 5 bpm)",
+    )
+    parser.add_argument(
+        "--target_col",
+        choices=["feasible_bpm", "hr_bpm"],
+        default="feasible_bpm",
+        help="feasible_bpm: only segments inside the quality borders"
+        " (NaN rows dropped); hr_bpm: all valid segments (old behaviour)",
+    )
+    parser.add_argument(
+        "--reweight",
+        choices=["sqrt_inv", "inv", "none"],
+        default="sqrt_inv",
+        help="Loss weights against HR imbalance (label distribution"
+        " smoothing): sqrt_inv = density^-0.5, inv = density^-1",
+    )
+    parser.add_argument(
+        "--lds_sigma", type=float, default=3.0,
+        help="Gaussian smoothing of the HR histogram for --reweight (bpm)",
+    )
+    parser.add_argument(
+        "--max_weight", type=float, default=10.0,
+        help="Cap of a loss weight (weights have mean 1)",
     )
     parser.add_argument("--n_splits", type=int, default=5)
     parser.add_argument(
@@ -582,7 +696,9 @@ def main():
     # --- Load Real Data ---
     print(f"Loading database from {args.db_path}...")
     # Train split with patient-wise CV groups
-    train_df = load_training_segments(args.db_path, args.n_splits)
+    train_df = load_training_segments(
+        args.db_path, args.n_splits, target_col=args.target_col
+    )
 
     # --- Load all segments once into memory ---
     segments, ok = load_segment_array(
@@ -627,8 +743,22 @@ def main():
         model = build_model(args.model, in_channels=1).to(device)
         train_model = torch.compile(model) if args.compile else model
         criterion = (
-            nn.HuberLoss(delta=5.0) if args.loss == "huber" else nn.MSELoss()
+            nn.HuberLoss(delta=5.0, reduction="none")
+            if args.loss == "huber" else nn.MSELoss(reduction="none")
         )
+
+        # Loss weights from the HR distribution of this fold's train part
+        w = None
+        if args.reweight != "none":
+            alpha = {"sqrt_inv": 0.5, "inv": 1.0}[args.reweight]
+            weigh = make_lds_weighter(
+                train_df["hr_bpm"].to_numpy()[train_idx], alpha,
+                args.lds_sigma, args.max_weight,
+            )
+            w_np = weigh(train_df["hr_bpm"].to_numpy())
+            w = torch.from_numpy(w_np).to(store)
+            for hr in (50, 60, 80, 100, 120, 140):
+                print(f"  weight at {hr} bpm: {weigh(np.array([hr]))[0]:.2f}")
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=args.lr, weight_decay=args.weight_decay
         )
@@ -660,11 +790,12 @@ def main():
             t0 = time.perf_counter()
             t_loss, t_mae, t_acc = train_one_epoch(
                 train_model, X, y, tr, args.batch_size, criterion,
-                optimizer, device, scaler,
+                optimizer, device, scaler, w,
             )
-            (v_loss, v_mae, v_acc), _, _ = evaluate(
-                train_model, X, y, va, args.batch_size, criterion, device
+            (v_loss, v_mae, v_acc), v_preds, v_targets = evaluate(
+                train_model, X, y, va, args.batch_size, criterion, device, w
             )
+            _, v_bmae = per_bin_errors(v_targets, v_preds)
 
             # Record history
             history["train_loss"].append(t_loss)
@@ -679,7 +810,7 @@ def main():
 
             print(
                 f"Epoch {epoch:02d} | Train MAE: {t_mae:.3f} Acc: {t_acc:.2%}"
-                f" | Val MAE: {v_mae:.3f} Acc: {v_acc:.2%}"
+                f" | Val MAE: {v_mae:.3f} bMAE: {v_bmae:.3f} Acc: {v_acc:.2%}"
                 f" | Val Loss: {v_loss:.4f}"
                 f" | lr {optimizer.param_groups[0]['lr']:.1e}"
                 f" | {time.perf_counter() - t0:.0f} s"
@@ -710,7 +841,7 @@ def main():
             torch.load(output_dir / "best_model.pt", map_location=device)
         )
         (_, _, _), fold_preds, fold_targets = evaluate(
-            model, X, y, va, args.batch_size, criterion, device
+            model, X, y, va, args.batch_size, criterion, device, w
         )
 
         fold_results = train_df.iloc[val_idx][
@@ -746,6 +877,9 @@ def main():
         print(f"Overall MAE: {mae:.3f} BPM")
         print(f"Overall RMSE: {rmse:.3f} BPM")
         print(f"Overall Acc (±5 BPM): {acc:.2%}")
+        bins, bmae = per_bin_errors(y_true.to_numpy(), y_pred.to_numpy())
+        print(f"Balanced MAE (mean over 10 bpm bins): {bmae:.3f} BPM")
+        print(bins.round(3).to_string())
         print(f"OOF Predictions saved to: {oof_save_path}")
         print("=" * 30)
 

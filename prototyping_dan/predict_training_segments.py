@@ -75,7 +75,11 @@ def load_model(
 
 
 def select_fold_segments(
-    parquet_dir: str, n_splits: int, fold: int, subset: str
+    parquet_dir: str,
+    n_splits: int,
+    fold: int,
+    subset: str,
+    target_col: str = "feasible_bpm",
 ) -> pd.DataFrame:
     """
     Selects the segments of one CV fold exactly as training.py does.
@@ -85,6 +89,7 @@ def select_fold_segments(
         n_splits: Number of CV splits used during training.
         fold: 1-based fold number (as in training.py / checkpoint names).
         subset: 'train', 'val' or 'all'.
+        target_col: Training target (must match training.py --target_col).
 
     Returns:
         Selected rows with '_source_relpath', '_source_row' and 'cv_role'.
@@ -93,7 +98,7 @@ def select_fold_segments(
         raise ValueError(f"--fold must be in 1..{n_splits}, got {fold}")
 
     train_df = load_training_segments(
-        parquet_dir, n_splits, keep_source_info=True
+        parquet_dir, n_splits, keep_source_info=True, target_col=target_col
     )
     train_idx, val_idx = make_cv_splits(train_df, n_splits)[fold - 1]
 
@@ -339,6 +344,13 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", *MODEL_REGISTRY.keys()],
         help="Architecture of the checkpoint; 'auto' detects it",
     )
+    parser.add_argument(
+        "--target-col",
+        choices=["feasible_bpm", "hr_bpm"],
+        default="feasible_bpm",
+        help="Training target of the checkpoint (must match training.py"
+        " --target_col, otherwise the folds differ)",
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
@@ -367,7 +379,8 @@ def main() -> None:
 
     print(f"Selecting fold {args.fold}/{args.n_splits} ({args.subset})...")
     selected = select_fold_segments(
-        args.parquet_dir, args.n_splits, args.fold, args.subset
+        args.parquet_dir, args.n_splits, args.fold, args.subset,
+        args.target_col,
     )
     if args.limit is not None and args.limit < len(selected):
         selected = selected.sample(n=args.limit, random_state=0)
