@@ -558,6 +558,124 @@ def evaluate(model, X, y, idx, batch_size, criterion, device, w=None):
     return metrics, preds.cpu().numpy(), targets.cpu().numpy()
 
 
+def train_fold(X, y, hr, train_idx, val_idx, args, device, store):
+    """
+    Trains one model on the rows train_idx of (X, y) with early stopping on
+    the validation loss of the rows val_idx. Used by main() and by
+    sweep_borders.py, so both train exactly the same way.
+
+    Args:
+        X, y: Segment array [N, T] and targets [N] (on `store`).
+        hr: Targets [N] as numpy (for the loss weights).
+        train_idx, val_idx: numpy row indices of the loadable segments.
+        args: Namespace with the options of add_training_args().
+        device: Training device; store: device of X and y.
+
+    Returns:
+        dict with model (best weights loaded), state_dict (best, on CPU),
+        history, best_val_loss, best_epoch, epochs_run, seconds,
+        criterion and w (loss weights tensor or None).
+    """
+    tr = torch.from_numpy(train_idx).to(store)
+    va = torch.from_numpy(val_idx).to(store)
+    print(f"Train segments: {len(tr)}, val segments: {len(va)}")
+
+    # Dynamic model instantiation
+    model = build_model(args.model, in_channels=1).to(device)
+    train_model = torch.compile(model) if args.compile else model
+    criterion = (
+        nn.HuberLoss(delta=5.0, reduction="none")
+        if args.loss == "huber" else nn.MSELoss(reduction="none")
+    )
+
+    # Loss weights from the HR distribution of this fold's train part
+    w = None
+    if args.reweight != "none":
+        alpha = {"sqrt_inv": 0.5, "inv": 1.0}[args.reweight]
+        weigh = make_lds_weighter(
+            hr[train_idx], alpha, args.lds_sigma, args.max_weight,
+        )
+        w = torch.from_numpy(weigh(hr)).to(store)
+        for v in (50, 60, 80, 100, 120, 140):
+            print(f"  weight at {v} bpm: {weigh(np.array([v]))[0]:.2f}")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=2
+    )
+    scaler = torch.amp.GradScaler(
+        device.type, enabled=device.type == "cuda"
+    )
+
+    best_val_loss = float("inf")
+    best_state = None
+    best_epoch = 0
+    patience_counter = 0
+    history = {
+        "train_loss": [], "train_mae": [], "train_acc": [],
+        "val_loss": [], "val_mae": [], "val_acc": [],
+        "epoch_seconds": [],
+    }
+    t_start = time.perf_counter()
+
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.perf_counter()
+        t_loss, t_mae, t_acc = train_one_epoch(
+            train_model, X, y, tr, args.batch_size, criterion,
+            optimizer, device, scaler, w,
+        )
+        (v_loss, v_mae, v_acc), v_preds, v_targets = evaluate(
+            train_model, X, y, va, args.batch_size, criterion, device, w
+        )
+        _, v_bmae = per_bin_errors(v_targets, v_preds)
+
+        history["train_loss"].append(t_loss)
+        history["train_mae"].append(t_mae)
+        history["train_acc"].append(t_acc)
+        history["val_loss"].append(v_loss)
+        history["val_mae"].append(v_mae)
+        history["val_acc"].append(v_acc)
+        history["epoch_seconds"].append(time.perf_counter() - t0)
+
+        scheduler.step(v_loss)
+
+        print(
+            f"Epoch {epoch:02d} | Train MAE: {t_mae:.3f} Acc: {t_acc:.2%}"
+            f" | Val MAE: {v_mae:.3f} bMAE: {v_bmae:.3f} Acc: {v_acc:.2%}"
+            f" | Val Loss: {v_loss:.4f}"
+            f" | lr {optimizer.param_groups[0]['lr']:.1e}"
+            f" | {time.perf_counter() - t0:.0f} s"
+        )
+
+        if v_loss < best_val_loss:
+            best_val_loss = v_loss
+            best_epoch = epoch
+            # Uncompiled module, so the checkpoint loads anywhere
+            best_state = {k: v.detach().cpu().clone()
+                          for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if patience_counter >= args.patience:
+            print(f"Early stopping triggered at epoch {epoch}")
+            break
+
+    model.load_state_dict(best_state)
+    return {
+        "model": model,
+        "state_dict": best_state,
+        "history": history,
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
+        "epochs_run": len(history["train_loss"]),
+        "seconds": time.perf_counter() - t_start,
+        "criterion": criterion,
+        "w": w,
+    }
+
+
 def plot_learning_curves(history, save_path):
     """Plots Train vs Val Loss, MAE, and Accuracy."""
     _, axes = plt.subplots(1, 3, figsize=(18, 5))
@@ -589,10 +707,8 @@ def plot_learning_curves(history, save_path):
 # -----------------------------
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Signal NN Training with Patient-Wise CV and Real Data"
-    )
+def add_training_args(parser: argparse.ArgumentParser) -> None:
+    """Model / optimization options (shared with sweep_borders.py)."""
     parser.add_argument(
         "--model",
         type=str,
@@ -600,21 +716,16 @@ def main():
         choices=list(MODEL_REGISTRY.keys()),
     )
     parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--batch_size", type=int, default=512)
+    parser.add_argument("--batch_size", "--batch-size", type=int,
+                        default=512)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", "--weight-decay", type=float,
+                        default=1e-4)
     parser.add_argument(
         "--loss",
         choices=["mse", "huber"],
         default="mse",
         help="huber is less sensitive to wrong labels (delta = 5 bpm)",
-    )
-    parser.add_argument(
-        "--target_col",
-        choices=["feasible_bpm", "hr_bpm"],
-        default="feasible_bpm",
-        help="feasible_bpm: only segments inside the quality borders"
-        " (NaN rows dropped); hr_bpm: all valid segments (old behaviour)",
     )
     parser.add_argument(
         "--reweight",
@@ -631,6 +742,27 @@ def main():
         "--max_weight", type=float, default=10.0,
         help="Cap of a loss weight (weights have mean 1)",
     )
+    parser.add_argument("--patience", type=int, default=5)
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the model (needs a GPU with compute capability >= 7.0)",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Signal NN Training with Patient-Wise CV and Real Data"
+    )
+    add_training_args(parser)
+    parser.add_argument(
+        "--target_col",
+        choices=["feasible_bpm", "hr_bpm"],
+        default="feasible_bpm",
+        help="feasible_bpm: only segments inside the quality borders"
+        " (NaN rows dropped); hr_bpm: all valid segments (old behaviour)",
+    )
     parser.add_argument("--n_splits", type=int, default=5)
     parser.add_argument(
         "--folds",
@@ -638,7 +770,6 @@ def main():
         default="all",
         help="1-based folds to train, e.g. '1' or '1,2' (data split unchanged)",
     )
-    parser.add_argument("--patience", type=int, default=5)
 
     # Data paths
     parser.add_argument(
@@ -676,12 +807,6 @@ def main():
         action="store_true",
         help="Keep the segment array in CPU RAM instead of GPU memory",
     )
-    parser.add_argument(
-        "--compile",
-        action="store_true",
-        help="torch.compile the model (needs a GPU with compute capability >= 7.0)",
-    )
-    parser.add_argument("--seed", type=int, default=42)
 
     args = parser.parse_args()
 
@@ -735,101 +860,19 @@ def main():
         # Indices of loadable segments, kept on the device of the data
         train_idx = train_idx[ok[train_idx]]
         val_idx = val_idx[ok[val_idx]]
-        tr = torch.from_numpy(train_idx).to(store)
-        va = torch.from_numpy(val_idx).to(store)
-        print(f"Train segments: {len(tr)}, val segments: {len(va)}")
-
-        # Dynamic model instantiation
-        model = build_model(args.model, in_channels=1).to(device)
-        train_model = torch.compile(model) if args.compile else model
-        criterion = (
-            nn.HuberLoss(delta=5.0, reduction="none")
-            if args.loss == "huber" else nn.MSELoss(reduction="none")
-        )
-
-        # Loss weights from the HR distribution of this fold's train part
-        w = None
-        if args.reweight != "none":
-            alpha = {"sqrt_inv": 0.5, "inv": 1.0}[args.reweight]
-            weigh = make_lds_weighter(
-                train_df["hr_bpm"].to_numpy()[train_idx], alpha,
-                args.lds_sigma, args.max_weight,
-            )
-            w_np = weigh(train_df["hr_bpm"].to_numpy())
-            w = torch.from_numpy(w_np).to(store)
-            for hr in (50, 60, 80, 100, 120, 140):
-                print(f"  weight at {hr} bpm: {weigh(np.array([hr]))[0]:.2f}")
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
-        )
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=2
-        )
-        scaler = torch.amp.GradScaler(
-            device.type, enabled=device.type == "cuda"
-        )
 
         # Create structured output directory
         output_dir = Path(args.output_dir) / args.model / f"fold_{fold + 1}"
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        best_val_loss = float("inf")
-        patience_counter = 0
-
-        # History tracking for plotting
-        history = {
-            "train_loss": [],
-            "train_mae": [],
-            "train_acc": [],
-            "val_loss": [],
-            "val_mae": [],
-            "val_acc": [],
-        }
-
-        for epoch in range(1, args.epochs + 1):
-            t0 = time.perf_counter()
-            t_loss, t_mae, t_acc = train_one_epoch(
-                train_model, X, y, tr, args.batch_size, criterion,
-                optimizer, device, scaler, w,
-            )
-            (v_loss, v_mae, v_acc), v_preds, v_targets = evaluate(
-                train_model, X, y, va, args.batch_size, criterion, device, w
-            )
-            _, v_bmae = per_bin_errors(v_targets, v_preds)
-
-            # Record history
-            history["train_loss"].append(t_loss)
-            history["train_mae"].append(t_mae)
-            history["train_acc"].append(t_acc)
-            history["val_loss"].append(v_loss)
-            history["val_mae"].append(v_mae)
-            history["val_acc"].append(v_acc)
-
-            # Scheduler step
-            scheduler.step(v_loss)
-
-            print(
-                f"Epoch {epoch:02d} | Train MAE: {t_mae:.3f} Acc: {t_acc:.2%}"
-                f" | Val MAE: {v_mae:.3f} bMAE: {v_bmae:.3f} Acc: {v_acc:.2%}"
-                f" | Val Loss: {v_loss:.4f}"
-                f" | lr {optimizer.param_groups[0]['lr']:.1e}"
-                f" | {time.perf_counter() - t0:.0f} s"
-            )
-
-            if v_loss < best_val_loss:
-                best_val_loss = v_loss
-                # Uncompiled module, so the checkpoint loads anywhere
-                torch.save(
-                    model.state_dict(),
-                    output_dir / "best_model.pt",
-                )
-                patience_counter = 0
-            else:
-                patience_counter += 1
-
-            if patience_counter >= args.patience:
-                print(f"Early stopping triggered at epoch {epoch}")
-                break
+        result = train_fold(
+            X, y, train_df["hr_bpm"].to_numpy(), train_idx, val_idx,
+            args, device, store,
+        )
+        model, history = result["model"], result["history"]
+        criterion, w = result["criterion"], result["w"]
+        torch.save(result["state_dict"], output_dir / "best_model.pt")
+        va = torch.from_numpy(val_idx).to(store)
 
         # Save learning curves for the fold
         plot_learning_curves(
@@ -837,9 +880,6 @@ def main():
         )
 
         # OOF Collection: Load best model and get predictions for the fold
-        model.load_state_dict(
-            torch.load(output_dir / "best_model.pt", map_location=device)
-        )
         (_, _, _), fold_preds, fold_targets = evaluate(
             model, X, y, va, args.batch_size, criterion, device, w
         )

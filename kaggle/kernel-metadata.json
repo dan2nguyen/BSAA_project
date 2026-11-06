@@ -1,0 +1,19 @@
+{
+  "id": "dannguyen2/bsaa-border-sweep",
+  "title": "bsaa-border-sweep",
+  "code_file": "run_sweep.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "true",
+  "machine_shape": "NvidiaTeslaT4",
+  "dataset_sources": [
+    "dannguyen2/bsaa-code",
+    "dannguyen2/hr-parts",
+    "dannguyen2/bsaa-ppg-project"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}
