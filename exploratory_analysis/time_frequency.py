@@ -1,3 +1,8 @@
+"""
+Spectral helpers for the exploration plots: PSD (Welch), spectrogram,
+spectral metrics and their plots (used by explore_plot.py).
+"""
+
 import numpy as np
 from scipy import signal
 

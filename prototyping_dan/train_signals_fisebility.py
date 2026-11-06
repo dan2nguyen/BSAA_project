@@ -1,3 +1,12 @@
+"""
+OLD first version of the training script (DataLoader based, HR threshold
+experiments). Superseded by training.py, kept only for reference.
+
+Usage:
+    python prototyping_dan/train_signals_fisebility.py --db_path ...
+        --edf_dir ... [--model cnn1d] [--hr_threshold 100]
+"""
+
 import argparse
 import os
 import sys

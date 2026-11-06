@@ -1,3 +1,12 @@
+"""
+OLD exploratory step: prints the share of True/False of every boolean column
+of references/corrupted_sections.parquet (made by exclude_corupted_sections.py)
+and of their combinations. Superseded by the flags in the segment database.
+
+Usage:
+    python exploratory_analysis/analyze_corruption_stats.py
+"""
+
 import pandas as pd
 import os
 

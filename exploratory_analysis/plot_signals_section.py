@@ -1,3 +1,13 @@
+"""
+OLD interactive viewer of single signal sections selected from
+databasing/references/evaluation_results.parquet and
+corrupted_sections.parquet (random or specific section, filtered by the
+notFlat / no_abnormal_waves flags).
+
+Usage:
+    python exploratory_analysis/plot_signals_section.py [--mode random] [--filter neither]
+"""
+
 import argparse
 import os
 import random

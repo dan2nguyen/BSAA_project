@@ -1,3 +1,10 @@
+"""
+Plots raw and filtered ECG/PPG of one EDF file (quick check of the filters).
+
+Usage:
+    python plot_single_edf.py <file.edf>
+"""
+
 import sys
 import matplotlib.pyplot as plt
 import numpy as np

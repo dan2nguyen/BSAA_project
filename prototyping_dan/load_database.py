@@ -1,3 +1,17 @@
+"""
+Helpers for reading the parquet segment database.
+
+- load_parquet_files(): reads all per-file parquet files, keeps the usable
+  segments (hr_valid & not is_flat) and returns (train_df, test_df) by the
+  'split' column.
+- extract_patient_id() / add_cv_groups(): patient ID from the file name and
+  a patient-wise assignment to CV groups (used by training.py).
+- load_signal_segment(): reads (and optionally plots) one ECG/PPG segment.
+
+Run directly (python prototyping_dan/load_database.py) it loads the train
+split and plots one sample segment as a quick check.
+"""
+
 import os
 import re
 import sys

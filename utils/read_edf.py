@@ -1,3 +1,9 @@
+"""
+read_edf_signals(path): reads the ECG and PPG channel (found by name) and
+the metadata (sampling rate, channels) of an EDF file, optionally only a
+slice of samples. Raw objects are cached per path (_RAW_CACHE).
+"""
+
 import warnings
 from functools import lru_cache
 

@@ -1,3 +1,18 @@
+"""
+Builds the segment database (data/hr_parts/seg<S>s_step<T>s/<subset>/<file>.parquet
+plus one combined parquet file) from the filtered EDF database.
+
+For every segment (default 10 s, step 5 s): ECG and PPG quality flags and
+metric values (compute_metrics of databasing/evaluation_signal_segments.py;
+flags on the raw segment, values on the z-scored segment), the
+Pan-Tompkins HR from the ECG (hr_bpm, hr_valid, invalid_reason, RR stats)
+and the train/test split from databasing/references/split_manifest.csv.
+Per-file results make the run resumable. Details and columns: README.md.
+
+Usage:
+    python databasing/pan_tompkins/build_hr_database.py [--limit 10]
+"""
+
 import argparse
 import csv
 import os

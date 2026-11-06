@@ -1,3 +1,11 @@
+"""
+Presentation plots of the ground-truth HR: ECG with detected peaks, HR over
+time and the Pan-Tompkins stages. Options are described in README.md.
+
+Usage:
+    python databasing/pan_tompkins/plots.py [<file.edf>] [--plots ecg_peaks hr pt_stages] [--show]
+"""
+
 import argparse
 import sys
 from pathlib import Path

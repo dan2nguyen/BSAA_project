@@ -1,3 +1,27 @@
+"""
+Trains the HR-from-PPG network with patient-wise 5-fold cross-validation.
+
+Data: train-split segments of the parquet database (hr_valid & not flat);
+with the default --target_col feasible_bpm only the segments inside the
+quality borders of feasible_bpm.py are used. The PPG of every segment is
+read once from the filtered EDF database, z-scored per segment and kept in
+GPU memory as float16 (optional cache: --cache_dir).
+
+Models: dilated_cnn (DilatedCNN1D, the one in use), cnn1d, bilstm.
+Training: AdamW, AMP on CUDA, LDS loss reweighting of rare HR ranges
+(--reweight, --lds_sigma, --max_weight), ReduceLROnPlateau, early stopping
+(--patience). train_fold() is reused by sweep_borders.py.
+
+Outputs (--output_dir/<model>/): fold_<k>/best_model.pt, learning curves,
+oof_predictions_<model>.csv (out-of-fold predictions of all folds).
+
+Usage:
+    python prototyping_dan/training.py --db_path data/hr_parts/seg10s_step5s
+        --edf_dir data/harmonized_ecg_ppg_database_filtered
+        --output_dir data/training_out_cnn --model dilated_cnn
+        [--folds 1] [--epochs 15] [--cache_dir data/segment_cache]
+"""
+
 import argparse
 import hashlib
 import os

@@ -1,3 +1,12 @@
+"""
+Interactive viewer of raw vs filtered ECG/PPG (apply_standard_filters) of
+EDF files, with buttons to move in time / switch files and a spectral view
+(time_frequency.plot_frequency_char).
+
+Usage:
+    python exploratory_analysis/explore_plot.py [--mode random|specific]
+"""
+
 import argparse
 import os
 import random

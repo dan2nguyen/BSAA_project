@@ -1,3 +1,11 @@
+"""
+Prints a slice of rows of a parquet file (read_parquet_slice()); a small
+inspection helper. Default file: the old evaluation_results_win2000.parquet.
+
+Usage:
+    python databasing/read_parquet.py
+"""
+
 import pandas as pd
 import pyarrow.parquet as pq
 

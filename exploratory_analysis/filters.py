@@ -1,5 +1,10 @@
-# utils/filters.py
-# main function to use is apply_standard_filters(ecg, ppg)
+"""
+Signal filters of the project. apply_standard_filters(ecg, ppg, fs) is the
+preprocessing of the filtered database (utils/filt_data_folder.py):
+  - ECG: 50 Hz notch + Butterworth band-pass 0.5-40 Hz (filtfilt),
+  - PPG: Butterworth band-pass 0.5-8 Hz (filtfilt).
+Run directly it plots the filter characteristics.
+"""
 
 import matplotlib.pyplot as plt
 import numpy as np

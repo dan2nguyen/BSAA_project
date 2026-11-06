@@ -1,3 +1,14 @@
+"""
+Filters a whole EDF database (apply_standard_filters from
+exploratory_analysis/filters.py) and saves it as the filtered database
+data/harmonized_ecg_ppg_database_filtered/ (EDF, resumable via
+filtered_progress.csv). filter_edf() does one file and is reused by
+predict.py, so prediction sees exactly the same signals.
+
+Usage:
+    python utils/filt_data_folder.py data/harmonized_ecg_ppg_databases
+"""
+
 import csv
 import gc
 import os
@@ -17,6 +28,85 @@ sys.path.append(str(root_dir))
 
 from exploratory_analysis.filters import apply_standard_filters
 from utils.read_edf import read_edf_signals
+
+
+def filter_edf(src_path, dst_path, require_ecg=True) -> bool:
+    """
+    Filters one EDF file (apply_standard_filters) and saves it as EDF.
+
+    This is the preprocessing of the filtered database. The EDF export
+    also quantizes the signals to 16 bit, which the quality metrics see
+    (e.g. zero_dev_dur), so predict.py reuses this function as is.
+
+    Args:
+        src_path: Input EDF file.
+        dst_path: Output EDF file (overwritten).
+        require_ecg: If False, a file without ECG is filtered and saved
+            with the PPG channel only (used at prediction time).
+
+    Returns:
+        False if the file lacks the PPG (or the ECG when required).
+    """
+    # 1. Read signals
+    ecg, ppg, metadata = read_edf_signals(src_path)
+    if ppg is None or (ecg is None and require_ecg):
+        return False
+
+    fs = metadata.get("sampling_rate", 100.0)
+
+    # 2. Filter (avoid extra copies in memory)
+    f_ecg, f_ppg = apply_standard_filters(
+        ecg.astype(np.float32, copy=False) if ecg is not None else None,
+        ppg.astype(np.float32, copy=False),
+        fs=fs,
+    )
+    del ecg, ppg
+    signals = [f_ppg] if f_ecg is None else [f_ecg, f_ppg]
+    ch_types = ["misc"] if f_ecg is None else ["ecg", "misc"]
+    del f_ecg, f_ppg
+
+    # 3. Preallocate array to avoid doubling RAM via vstack/np.array
+    min_len = min(len(x) for x in signals)
+    data = np.empty((len(signals), min_len), dtype=np.float32)
+    for i in range(len(signals)):
+        data[i] = signals[i][:min_len]
+    del signals
+
+    ch_names = [
+        name
+        for name in metadata.get("channel_mapping", {}).values()
+        if name is not None
+    ]
+    if len(ch_names) < len(ch_types):
+        ch_names = ["ECG", "PPG"][-len(ch_types):]
+
+    # 4. Save to EDF
+    try:
+        info = mne.create_info(
+            ch_names=ch_names,
+            sfreq=fs,
+            ch_types=ch_types,
+        )
+        raw_filt = mne.io.RawArray(data, info, verbose=False)
+        raw_filt.export(dst_path, fmt="edf", overwrite=True)
+    except Exception as e:
+        if "exceeds maximum field length" in str(e):
+            info = mne.create_info(
+                ch_names=ch_names,
+                sfreq=fs,
+                ch_types=["misc"] * len(ch_types),
+            )
+            raw_filt = mne.io.RawArray(data, info, verbose=False)
+            raw_filt.export(dst_path, fmt="edf", overwrite=True)
+        else:
+            raise e  # noqa: TRY201
+    finally:
+        # Explicit cleanup for each file iteration
+        del data
+        if "raw_filt" in locals():
+            del raw_filt
+        gc.collect()
+    return True
 
 
 def main():
@@ -67,67 +157,8 @@ def main():
             os.makedirs(os.path.dirname(dst_path), exist_ok=True)
 
             try:
-                # 1. Read signals
-                ecg, ppg, metadata = read_edf_signals(src_path)
-                if ecg is None or ppg is None:
+                if not filter_edf(src_path, dst_path):
                     continue
-
-                fs = metadata.get("sampling_rate", 100.0)
-
-                # 2. Filter (avoid extra copies in memory)
-                f_ecg, f_ppg = apply_standard_filters(
-                    ecg.astype(np.float32, copy=False),
-                    ppg.astype(np.float32, copy=False),
-                    fs=fs,
-                )
-                del ecg, ppg
-
-                # 3. Preallocate array to avoid doubling RAM via vstack/np.array
-                min_len = min(len(f_ecg), len(f_ppg))
-                data = np.empty((2, min_len), dtype=np.float32)
-                data[0] = f_ecg[:min_len]
-                del f_ecg
-                data[1] = f_ppg[:min_len]
-                del f_ppg
-
-                ch_names = list(
-                    metadata.get("channel_mapping", {}).values()
-                )
-                if len(ch_names) < 2:
-                    ch_names = ["ECG", "PPG"]
-
-                # 4. Save to EDF
-                try:
-                    info = mne.create_info(
-                        ch_names=ch_names,
-                        sfreq=fs,
-                        ch_types=["ecg", "misc"],
-                    )
-                    raw_filt = mne.io.RawArray(
-                        data, info, verbose=False
-                    )
-                    raw_filt.export(dst_path, fmt="edf", overwrite=True)
-                except Exception as e:
-                    if "exceeds maximum field length" in str(e):
-                        info = mne.create_info(
-                            ch_names=ch_names,
-                            sfreq=fs,
-                            ch_types=["misc", "misc"],
-                        )
-                        raw_filt = mne.io.RawArray(
-                            data, info, verbose=False
-                        )
-                        raw_filt.export(
-                            dst_path, fmt="edf", overwrite=True
-                        )
-                    else:
-                        raise e  # noqa: TRY201
-                finally:
-                    # Explicit cleanup for each file iteration
-                    del data
-                    if "raw_filt" in locals():
-                        del raw_filt
-                    gc.collect()
 
                 # Update progress
                 with open(progress_csv, "a", newline="") as f:
