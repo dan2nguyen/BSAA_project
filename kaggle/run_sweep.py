@@ -43,6 +43,11 @@ SWEEP_ARGS = [
 ]
 TIME_BUDGET_HOURS = 11.0  # Kaggle GPU sessions end after 12 h
 KEEP_CACHE_IN_OUTPUT = True  # cache (~1.3 GB) in /kaggle/working/cache
+# Optional manual paths (None = search /kaggle/input). The parquet folder
+# must contain the metric columns (ecg_kurtosis, ppg_kurtosis, ...).
+PARQUET_DIR = None  # e.g. "/kaggle/input/datasets/dannguyen2/hr-parts/seg10s_step5s"
+EDF_DIR = None
+REQUIRED_COLS = ("ecg_kurtosis", "ppg_kurtosis", "ppg_zero_dev_dur")
 
 INPUT = Path("/kaggle/input")
 ON_KAGGLE = INPUT.exists()
@@ -125,6 +130,18 @@ def ensure_deps():
         )
 
 
+def parquet_has_columns(d: Path) -> tuple[bool, str]:
+    """Does the first parquet file below d have REQUIRED_COLS?"""
+    import pyarrow.parquet as pq
+
+    f = next(d.glob("*/*.parquet"), None)
+    if f is None:
+        return False, "parquet files"
+    names = set(pq.read_schema(f).names)
+    missing = [c for c in REQUIRED_COLS if c not in names]
+    return not missing, ",".join(missing)
+
+
 def find_inputs() -> dict:
     if not ON_KAGGLE:
         return {
@@ -136,9 +153,10 @@ def find_inputs() -> dict:
             "resume": [],
         }
     res = {"parquet": None, "edf": None, "cache": None, "resume": []}
+    parquet_cands = []
     for d, subdirs, files in walk_inputs():
-        if res["parquet"] is None and d.name == "seg10s_step5s":
-            res["parquet"] = d
+        if any(next(Path(d, s).glob("*.parquet"), None) for s in subdirs[:3]):
+            parquet_cands.append(d)  # <dir>/<base_folder>/<file>.parquet
         if (
             res["edf"] is None
             and d.name == "harmonized_ecg_ppg_database_filtered"
@@ -151,15 +169,24 @@ def find_inputs() -> dict:
         res["resume"] += [
             d / f for f in files if f == "sweep_results.zip"
         ]
-    if (
-        res["parquet"] is None
-    ):  # parquet dataset uploaded without the subfolder
-        for d, subdirs, files in walk_inputs():
-            if any(
-                Path(d, s).glob("*.parquet") for s in subdirs
-            ) and "hr" in str(d):
-                res["parquet"] = d
-                break
+    # Several copies of the database may be attached (e.g. an old one
+    # without metric columns inside bsaa-ppg-project): use the first
+    # folder whose parquet files have the border columns.
+    for d in sorted(parquet_cands, key=lambda d: d.name != "seg10s_step5s"):
+        ok, cols = parquet_has_columns(d)
+        print(f"Parquet candidate {d}: {'OK' if ok else 'missing ' + cols}")
+        if ok and res["parquet"] is None:
+            res["parquet"] = d
+    if PARQUET_DIR:
+        res["parquet"] = Path(PARQUET_DIR)
+    if EDF_DIR:
+        res["edf"] = Path(EDF_DIR)
+    if res["parquet"] is None and res["cache"] is None:
+        raise FileNotFoundError(
+            "No parquet folder with the metric columns"
+            f" {REQUIRED_COLS} in /kaggle/input - attach the current"
+            " hr-parts dataset or set PARQUET_DIR"
+        )
     print("Inputs:", {k: str(v) for k, v in res.items()})
     return res
 
@@ -240,7 +267,7 @@ def main():
     print(" ".join(cmd), flush=True)
     env = dict(os.environ, TQDM_DISABLE="1")
     code_rc = subprocess.run(cmd, env=env).returncode
-    if code_rc != 0:
+    if code_rc != 0 and (out / "results").exists():
         print(
             f"sweep exited with {code_rc}; building the report from what is done"
         )
