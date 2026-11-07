@@ -10,7 +10,8 @@ GPU memory as float16 (optional cache: --cache_dir).
 Models: dilated_cnn (DilatedCNN1D, the one in use), cnn1d, bilstm.
 Training: AdamW, AMP on CUDA, LDS loss reweighting of rare HR ranges
 (--reweight, --lds_sigma, --max_weight), ReduceLROnPlateau, early stopping
-(--patience). train_fold() is reused by sweep_borders.py.
+(--patience, not before --min_epochs). train_fold() is reused by
+sweep_borders.py.
 
 Outputs (--output_dir/<model>/): fold_<k>/best_model.pt, learning curves,
 oof_predictions_<model>.csv (out-of-fold predictions of all folds).
@@ -19,7 +20,8 @@ Usage:
     python prototyping_dan/training.py --db_path data/hr_parts/seg10s_step5s
         --edf_dir data/harmonized_ecg_ppg_database_filtered
         --output_dir data/training_out_cnn --model dilated_cnn
-        [--folds 1] [--epochs 15] [--cache_dir data/segment_cache]
+        [--folds 1] [--epochs 40] [--min_epochs 30]
+        [--cache_dir data/segment_cache]
 """
 
 import argparse
@@ -682,7 +684,8 @@ def train_fold(X, y, hr, train_idx, val_idx, args, device, store):
         else:
             patience_counter += 1
 
-        if patience_counter >= args.patience:
+        # No early stopping before min_epochs; the best epoch is still kept
+        if patience_counter >= args.patience and epoch >= args.min_epochs:
             print(f"Early stopping triggered at epoch {epoch}")
             break
 
@@ -739,7 +742,12 @@ def add_training_args(parser: argparse.ArgumentParser) -> None:
         default="dilated_cnn",
         choices=list(MODEL_REGISTRY.keys()),
     )
-    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--epochs", type=int, default=40,
+                        help="Maximum number of epochs")
+    parser.add_argument(
+        "--min_epochs", type=int, default=30,
+        help="Early stopping (--patience) can only stop after this epoch",
+    )
     parser.add_argument("--batch_size", "--batch-size", type=int,
                         default=512)
     parser.add_argument("--lr", type=float, default=1e-3)

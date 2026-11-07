@@ -295,6 +295,12 @@ Report (`data/test_evaluation/<model>_<fold>_<mode>/report.md`, plus
 - per dataset, per subject, per HR bin, the reasons for NONE, and the
   pipeline check (recomputed metrics vs the database).
 
+Result of the current model (`fold_1`, PPG borders, 6 Nov 2026,
+`data/test_evaluation/dilated_cnn_fold_1_ppg/report.md`): HR for 66.5 % of
+the 171.7k test segments, MAE 4.71 bpm, RMSE 8.48 bpm, 72.6 % within ±5 bpm
+(no filter: MAE 5.86 bpm; full ECG + PPG borders: 31.8 % coverage, MAE
+3.99 bpm; CV fold 1: MAE 3.32 bpm).
+
 Options: `--workers 2` (RAM: ~1-2 GB per worker; recordings longer than
 `--big-file-samples` run one at a time), `--input-filtered` (faster, same
 signals), `--all-segments` (also the segments without a reference HR).
