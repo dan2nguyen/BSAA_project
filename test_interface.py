@@ -1,0 +1,234 @@
+"""
+Runs the HR model on one EDF file or a folder of EDF files.
+
+For every recording it saves the HR per 10 s segment (NONE if the PPG is
+not usable), an HR value per second, and, if the file has an ECG channel,
+a comparison with the ECG heart rate.
+
+    uv run python test_interface.py <file.edf | folder> --model-path best_model.pt
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+
+ROOT = Path(__file__).resolve().parent
+sys.path.append(str(ROOT))
+
+from databasing.pan_tompkins.heart_rate import estimate_hr  # noqa: E402
+from predict import (  # noqa: E402
+    DEFAULT_MODEL,
+    SEGMENT_S,
+    STEP_S,
+    HRPredictor,
+    preprocess_edf,
+    recording_hr,
+)
+
+
+def load_signals(path: Path, use_reference: bool):
+    if use_reference:
+        try:
+            return preprocess_edf(path, with_ecg=True)
+        except ValueError as e:
+            if "ECG" not in str(e):
+                raise
+    _, ppg, fs = preprocess_edf(path, with_ecg=False)
+    return None, ppg, fs
+
+
+def reference_hr(ecg: np.ndarray, fs: float) -> pd.DataFrame:
+    ref, _ = estimate_hr(ecg, fs, SEGMENT_S, STEP_S)
+    ref = ref[["start", "hr_bpm", "valid"]].rename(
+        columns={"hr_bpm": "ref_hr_bpm"})
+    ref.loc[~ref["valid"], "ref_hr_bpm"] = np.nan
+    return ref.drop(columns="valid")
+
+
+def hr_per_second(seg: pd.DataFrame, duration_s: float,
+                  max_gap_s: float) -> pd.DataFrame:
+    # Segment estimates at the segment centres, interpolated over short gaps
+    t = np.arange(0, int(np.floor(duration_s)) + 1, dtype=float)
+    centres = ((seg["start_s"] + seg["end_s"]) / 2).to_numpy()
+    hr = seg["hr_bpm"].to_numpy(float)
+    ok = np.isfinite(hr)
+    out = np.full(len(t), np.nan)
+    if ok.any():
+        c, h = centres[ok], hr[ok]
+        out = np.interp(t, c, h, left=np.nan, right=np.nan)
+        # no interpolation over long gaps
+        k = np.searchsorted(c, t, side="right")
+        inside = (k > 0) & (k < len(c))
+        gap = np.full(len(t), np.inf)
+        gap[inside] = c[k[inside]] - c[k[inside] - 1]
+        on_point = np.isin(t, c)
+        out[(gap > max_gap_s + 1e-9) & ~on_point] = np.nan
+
+    source = np.full(len(t), "NONE", dtype=object)
+    if len(centres):
+        nearest = np.abs(t[:, None] - centres[None, :]).argmin(axis=1)
+        has = np.isfinite(out)
+        own = ok[nearest]
+        source[has & own] = "model"
+        source[has & ~own] = "interpolated"
+    return pd.DataFrame({"time_s": t, "hr_bpm": np.round(out, 2),
+                         "source": source})
+
+
+def error_stats(err: np.ndarray) -> dict:
+    if len(err) == 0:
+        return {k: np.nan for k in ("MAE", "RMSE", "bias", "LoA_low",
+                                    "LoA_high", "within_5bpm_%")}
+    sd = err.std(ddof=1) if len(err) > 1 else 0.0
+    return {
+        "MAE": np.abs(err).mean(),
+        "RMSE": np.sqrt((err ** 2).mean()),
+        "bias": err.mean(),
+        "LoA_low": err.mean() - 1.96 * sd,
+        "LoA_high": err.mean() + 1.96 * sd,
+        "within_5bpm_%": (np.abs(err) <= 5).mean() * 100,
+    }
+
+
+def process(path: Path, predictor: HRPredictor, out_dir: Path,
+            use_reference: bool, max_gap_s: float):
+    ecg, ppg, fs = load_signals(path, use_reference)
+    seg = predictor.predict_signal(ppg, fs)
+
+    table = pd.DataFrame({
+        "start_s": seg["start_t"].round(2),
+        "end_s": seg["end_t"].round(2),
+        "hr_bpm": seg["hr_bpm"].round(2),
+        "reason": np.where(seg["feasible"], "", seg["reason"]),
+    })
+    if ecg is not None:
+        ref = reference_hr(ecg, fs)
+        table["ref_hr_bpm"] = (
+            seg[["start"]].merge(ref, on="start", how="left")["ref_hr_bpm"]
+            .round(2).to_numpy())
+
+    name = path.stem
+    table.to_csv(out_dir / f"{name}_segments.csv", index=False)
+    hr_per_second(table, len(ppg) / fs, max_gap_s).to_csv(
+        out_dir / f"{name}_hr_1hz.csv", index=False)
+
+    row = {
+        "file": str(path),
+        "duration_s": round(len(ppg) / fs, 1),
+        "segments": len(table),
+        "coverage_%": table["hr_bpm"].notna().mean() * 100 if len(table)
+        else 0.0,
+        "recording_hr_bpm": recording_hr(seg),
+    }
+    errors = np.array([])
+    if ecg is not None:
+        both = table.dropna(subset=["hr_bpm", "ref_hr_bpm"])
+        errors = (both["hr_bpm"] - both["ref_hr_bpm"]).to_numpy()
+        row["reference_segments"] = int(table["ref_hr_bpm"].notna().sum())
+        row["compared_segments"] = len(both)
+        row["reference_hr_bpm"] = table["ref_hr_bpm"].median()
+        row.update(error_stats(errors))
+        means = ((both["hr_bpm"] + both["ref_hr_bpm"]) / 2).to_numpy()
+    else:
+        means = np.array([])
+    return row, errors, means
+
+
+def bland_altman(errors: np.ndarray, means: np.ndarray, path: Path):
+    s = error_stats(errors)
+    fig, ax = plt.subplots(figsize=(8, 4.6))
+    ax.scatter(means, errors, s=4, alpha=0.3, color="#2a78d6",
+               linewidths=0)
+    for y, label, style in [
+        (s["bias"], f"bias {s['bias']:+.2f}", "-"),
+        (s["LoA_high"], f"+1.96 SD {s['LoA_high']:+.1f}", "--"),
+        (s["LoA_low"], f"-1.96 SD {s['LoA_low']:+.1f}", "--"),
+    ]:
+        ax.axhline(y, color="#eb6834", linewidth=1.5, linestyle=style)
+        ax.annotate(label, (1, y), xycoords=("axes fraction", "data"),
+                    ha="right", va="bottom", fontsize=9)
+    ax.set_xlabel("Mean of predicted and reference HR (bpm)")
+    ax.set_ylabel("Predicted - reference (bpm)")
+    ax.set_title(f"Bland-Altman, {len(errors):,} segments", loc="left")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def find_edfs(target: Path) -> list[Path]:
+    if target.is_dir():
+        return sorted(p for p in target.rglob("*")
+                      if p.suffix.lower() == ".edf")
+    return [target]
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="HR from PPG for EDF recordings")
+    p.add_argument("input", type=Path, help="EDF file or folder")
+    p.add_argument("--model-path", type=Path, default=DEFAULT_MODEL)
+    p.add_argument("--output-dir", type=Path,
+                   default=ROOT / "results" / "test_interface")
+    p.add_argument("--max-gap-s", type=float, default=15.0,
+                   help="max gap (s) to interpolate in the 1 Hz output")
+    p.add_argument("--no-reference", action="store_true",
+                   help="skip the ECG comparison")
+    p.add_argument("--device", default=None, help="cpu or cuda")
+    return p.parse_args()
+
+
+def main():
+    a = parse_args()
+    files = find_edfs(a.input)
+    if not files:
+        sys.exit(f"No EDF files found in {a.input}")
+    if not Path(a.model_path).exists():
+        sys.exit(f"Model file not found: {a.model_path}")
+    a.output_dir.mkdir(parents=True, exist_ok=True)
+
+    predictor = HRPredictor(a.model_path, device=a.device)
+    rows, all_err, all_mean = [], [], []
+    for i, path in enumerate(files, 1):
+        print(f"[{i}/{len(files)}] {path.name} ...", end=" ", flush=True)
+        try:
+            row, err, mean = process(path, predictor, a.output_dir,
+                                     not a.no_reference, a.max_gap_s)
+        except Exception as e:
+            print(f"FAILED ({e})")
+            rows.append({"file": str(path), "error": str(e)})
+            continue
+        rows.append(row)
+        all_err.append(err)
+        all_mean.append(mean)
+        hr = row["recording_hr_bpm"]
+        msg = (f"HR {hr:.1f} bpm" if hr is not None else "HR NONE")
+        msg += f", coverage {row['coverage_%']:.0f} %"
+        if not np.isnan(row.get("MAE", np.nan)):
+            msg += f", MAE vs ECG {row['MAE']:.2f} bpm"
+        print(msg)
+
+    summary = pd.DataFrame(rows)
+    summary.round(3).to_csv(a.output_dir / "summary.csv", index=False)
+
+    err = np.concatenate(all_err) if all_err else np.array([])
+    mean = np.concatenate(all_mean) if all_mean else np.array([])
+    print(f"\nRecordings: {len(files)}, results in {a.output_dir}")
+    if len(err):
+        s = error_stats(err)
+        print(f"All recordings vs ECG ({len(err):,} segments): "
+              f"MAE {s['MAE']:.2f} bpm, RMSE {s['RMSE']:.2f} bpm, "
+              f"bias {s['bias']:+.2f} bpm, 95 % LoA "
+              f"{s['LoA_low']:+.1f} to {s['LoA_high']:+.1f} bpm, "
+              f"within +-5 bpm {s['within_5bpm_%']:.1f} %")
+        bland_altman(err, mean, a.output_dir / "bland_altman.png")
+
+
+if __name__ == "__main__":
+    main()
