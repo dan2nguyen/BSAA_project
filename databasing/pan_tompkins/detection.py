@@ -1,3 +1,13 @@
+"""
+QRS detection for the ground-truth HR.
+
+- detect_qrs(ecg, fs): peaks via sleepecg.detect_heartbeats (modified
+  Pan-Tompkins), run on 300 s chunks with overlap, z-scored per chunk,
+  flat chunks skipped.
+- pan_tompkins_stages / pan_tompkins_threshold: classic Pan-Tompkins steps,
+  only for the illustration plot in plots.py.
+"""
+
 import numpy as np
 import scipy.signal
 from sleepecg import detect_heartbeats

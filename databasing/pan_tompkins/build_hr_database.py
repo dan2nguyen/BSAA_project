@@ -1,3 +1,18 @@
+"""
+Builds the segment database (data/hr_parts/seg<S>s_step<T>s/<subset>/<file>.parquet
+plus one combined parquet file) from the filtered EDF database.
+
+For every segment (default 10 s, step 5 s): ECG and PPG quality flags and
+metric values (compute_metrics of databasing/evaluation_signal_segments.py;
+flags on the raw segment, values on the z-scored segment), the
+Pan-Tompkins HR from the ECG (hr_bpm, hr_valid, invalid_reason, RR stats)
+and the train/test split from databasing/references/split_manifest.csv.
+Per-file results make the run resumable. Details and columns: README.md.
+
+Usage:
+    python databasing/pan_tompkins/build_hr_database.py [--limit 10]
+"""
+
 import argparse
 import csv
 import os
@@ -47,6 +62,24 @@ FLAG_COLUMNS = [
     for signal in ("ecg", "ppg")
     for name in FLAG_NAMES
 ]
+# Numeric values of compute_metrics, computed on the z-scored segment.
+# "std" is left out (always ~1 after z-scoring); "std_piecewise_min" is
+# the smallest of the 5 piecewise STDs (drop-outs inside the segment).
+VALUE_NAMES = [
+    "dynamic_range",
+    "mean_absolute_derivative",
+    "zero_dev_dur",
+    "std_piecewise_min",
+    "LF_ratio",
+    "InBand_power_ratio",
+    "kurtosis",
+    "Skewness",
+]
+VALUE_COLUMNS = [
+    f"{signal}_{name}"
+    for signal in ("ecg", "ppg")
+    for name in VALUE_NAMES
+]
 COLUMNS = [
     "base_folder",
     "edf_filename",
@@ -60,6 +93,7 @@ COLUMNS = [
     "sampling_rate",
     "is_flat",
     *FLAG_COLUMNS,
+    *VALUE_COLUMNS,
     "hr_bpm",
     "hr_valid",
     "invalid_reason",
@@ -115,15 +149,28 @@ def part_path_for(edf_path: Path, parts_dir: Path) -> Path:
     return parts_dir / edf_path.parent.name / f"{edf_path.stem}.parquet"
 
 
-def compute_segment_flags(
+def normalize_segment(x: np.ndarray) -> np.ndarray:
+    """
+    Per-segment z-score, the same as the model input in training.py:
+    (x - mean) / (std + 1e-8) with the unbiased std.
+    """
+    return (x - x.mean()) / (x.std(ddof=1) + 1e-8)
+
+
+def compute_segment_metrics(
     signal: np.ndarray,
     fs: float,
     starts: np.ndarray,
     ends: np.ndarray,
     signal_type: str,
-) -> dict[str, np.ndarray]:
+) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """
-    Evaluates the quality flags of `compute_metrics` for every segment.
+    Evaluates `compute_metrics` for every segment.
+
+    The boolean flags are computed on the raw segment, because the flatness
+    thresholds are absolute (in the units of the recording). The numeric
+    values are computed on the z-scored segment, so they are comparable
+    across recordings and devices with different units/gains.
 
     Args:
         signal (np.ndarray): 1D signal (whole recording).
@@ -133,32 +180,47 @@ def compute_segment_flags(
         signal_type (str): "ecg" or "ppg".
 
     Returns:
-        dict: "<signal_type>_<flag name>" -> boolean array per segment.
+        tuple: (flags, values)
+            flags: "<signal_type>_<flag name>" -> boolean array per segment.
+            values: "<signal_type>_<value name>" -> float array per segment.
     """
     flags = {name: [] for name in FLAG_NAMES}
+    values = {name: [] for name in VALUE_NAMES}
     with warnings.catch_warnings():
         # Kurtosis/skewness of a flat segment: harmless, it is flagged
         warnings.filterwarnings(
             "ignore", message="Precision loss occurred in moment"
         )
         for start, end in zip(starts, ends):
-            metrics = compute_metrics(
-                signal[start:end], fs, signal_type
-            )
+            segment = signal[start:end]
+            raw = compute_metrics(segment, fs, signal_type)
             for name in FLAG_NAMES:
-                flags[name].append(bool(metrics[name]))
-    return {
-        f"{signal_type}_{name}": np.array(values, dtype=bool)
-        for name, values in flags.items()
-    }
+                flags[name].append(bool(raw[name]))
+
+            norm = compute_metrics(
+                normalize_segment(segment), fs, signal_type
+            )
+            norm["std_piecewise_min"] = min(norm["std_piecewise"])
+            for name in VALUE_NAMES:
+                values[name].append(norm[name])
+    return (
+        {
+            f"{signal_type}_{name}": np.array(v, dtype=bool)
+            for name, v in flags.items()
+        },
+        {
+            f"{signal_type}_{name}": np.array(v, dtype=np.float64)
+            for name, v in values.items()
+        },
+    )
 
 
 def process_file(
     edf_path: Path, segment_s: float, step_s: float, split: str
 ) -> pd.DataFrame | None:
     """
-    Computes the database rows of one EDF file: quality flags of ECG and
-    PPG and the Pan-Tompkins HR for every segment.
+    Computes the database rows of one EDF file: quality flags and metric
+    values of ECG and PPG and the Pan-Tompkins HR for every segment.
 
     Segments are laid out like in evaluation_signal_segments.py, so
     section_id, start and end match its output for the same window and
@@ -184,10 +246,13 @@ def process_file(
     hr = compute_hr_segments(peaks, len(ecg), fs, segment_s, step_s)
     starts = hr["start"].to_numpy()
     ends = hr["end"].to_numpy()
-    flags = {
-        **compute_segment_flags(ecg, fs, starts, ends, "ecg"),
-        **compute_segment_flags(ppg, fs, starts, ends, "ppg"),
-    }
+    ecg_flags, ecg_values = compute_segment_metrics(
+        ecg, fs, starts, ends, "ecg"
+    )
+    ppg_flags, ppg_values = compute_segment_metrics(
+        ppg, fs, starts, ends, "ppg"
+    )
+    flags = {**ecg_flags, **ppg_flags}
     mark_flat_segments(hr, flags["ecg_is_flat"])
 
     return pd.DataFrame(
@@ -204,6 +269,8 @@ def process_file(
             "sampling_rate": fs,
             "is_flat": flags["ecg_is_flat"] | flags["ppg_is_flat"],
             **flags,
+            **ecg_values,
+            **ppg_values,
             "hr_bpm": hr["hr_bpm"].to_numpy(),
             "hr_valid": hr["valid"].to_numpy(dtype=bool),
             "invalid_reason": hr["invalid_reason"].to_numpy(),
@@ -216,6 +283,17 @@ def process_file(
         },
         columns=COLUMNS,
     )
+
+
+def part_is_current(part_path: Path) -> bool:
+    """
+    True if a stored part exists and has all columns of COLUMNS. Parts
+    written by an older version (e.g. without the metric values) are
+    recomputed.
+    """
+    if not part_path.exists():
+        return False
+    return set(COLUMNS) <= set(pq.read_schema(part_path).names)
 
 
 def write_parquet_atomic(df: pd.DataFrame, path: Path):
@@ -477,8 +555,9 @@ def print_summary(stats: dict):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
-            "Build the segment database: quality flags of ECG and PPG and"
-            " the Pan-Tompkins HR for every segment of all EDF files."
+            "Build the segment database: quality flags and metric values"
+            " of ECG and PPG and the Pan-Tompkins HR for every segment of"
+            " all EDF files."
             " Results are stored per file, so an interrupted run continues"
             " where it stopped."
         )
@@ -569,7 +648,7 @@ if __name__ == "__main__":
     todo = [
         f
         for f in files
-        if args.overwrite or not part_path_for(f, parts_dir).exists()
+        if args.overwrite or not part_is_current(part_path_for(f, parts_dir))
     ]
     large = [
         f for f in todo if f.stat().st_size >= args.large_file_gb * 1e9

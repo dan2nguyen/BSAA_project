@@ -1,3 +1,13 @@
+"""
+OLD exploratory step: from references/evaluation_results.parquet (output of
+databasing/evaluation_signal_segments.py) computes per section 'notFlat' and
+'no_abnormal_waves' and saves them to references/corrupted_sections.parquet.
+Superseded by the flags in the segment database (build_hr_database.py).
+
+Usage:
+    python exploratory_analysis/exclude_corupted_sections.py
+"""
+
 import os
 
 import pandas as pd

@@ -23,6 +23,7 @@ dependencies = [
     { name = "pyarrow" },
     { name = "scipy" },
     { name = "sleepecg" },
+    { name = "tqdm" },
 ]
 
 [package.metadata]
@@ -35,6 +36,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=26.0.0" },
     { name = "scipy", specifier = ">=1.18.1" },
     { name = "sleepecg", specifier = ">=0.5.9" },
+    { name = "tqdm", specifier = ">=4.70.1" },
 ]
 
 [[package]]

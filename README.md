@@ -1,49 +1,56 @@
 # BSAA_project
 DREAM TEAM
 
-**This project is managet by UV** <br>
-How to set project enviroment:<br>
->pip install uv<br>
+Heart rate (HR) estimation from PPG with a 1D CNN. The reference HR comes from
+the simultaneously recorded ECG (Pan-Tompkins). Segments whose PPG is not
+usable are rejected by quality borders, and the model returns **NONE** for
+them instead of a wrong HR.
 
-For venv initialization and updating:
->uv sync<br>
+**This project is managed by uv.** Set up the environment:
+```bash
+pip install uv
+uv sync          # create / update the venv
+uv add <package> # add a library
+```
+All commands are run from the repository root (`uv run python ...`).
 
-To add pip library to uv
-> uv add ...
-
-
-
-Project dscription
 <img width="1129" height="676" alt="image" src="https://github.com/user-attachments/assets/e342d970-db9f-4e0b-9e9b-57fd63340bd9" />
 
-## Database Filtering
+## Pipeline and key scripts
 
-To ensure signal quality and remove noise (e.g., power line interferenc
-e), the database is filtered before further processing.
+| # | Step | Script | Output |
+|---|---|---|---|
+| 0 | Subject-wise 80/20 train/test split | `utils/split_data.py` | `databasing/references/split_manifest.csv` |
+| 1 | Filtering of the raw EDF database | `utils/filt_data_folder.py` (filters in `exploratory_analysis/filters.py`) | `data/harmonized_ecg_ppg_database_filtered/` |
+| 2 | Segment database: quality metrics + ECG reference HR per 10 s segment (step 5 s) | `databasing/pan_tompkins/build_hr_database.py` (metrics: `databasing/evaluation_signal_segments.py`, HR: `detection.py`, `heart_rate.py`) | `data/hr_parts/seg10s_step5s/<subset>/<file>.parquet` |
+| 3 | Finding the quality borders: model trained on all segments, its errors analysed per metric | `prototyping_dan/predict_training_segments.py`, `run_commands.py`, `analyze_predictions.py`, `analyze_folds_combined.py` | `data/fold_analysis/combined_report/` |
+| 4 | Feasibility column (`feasible_bpm` = HR inside all borders, else NaN) | `prototyping_dan/feasible_bpm.py` (`FEASIBILITY_BOUNDS`) | column in the parquet files |
+| 5 | Training (patient-wise 5-fold CV, target `feasible_bpm`) | `prototyping_dan/training.py` | `data/training_out_cnn/dilated_cnn/fold_<k>/best_model.pt`, OOF predictions |
+| 6 | Tuning the borders (sweep on Kaggle GPUs) | `prototyping_dan/sweep_borders.py`, `report_borders.py`, `kaggle/` | sweep report (see the last section) |
+| 7 | Prediction for one EDF recording: HR or NONE | `predict.py` | printed / CSV |
+| 8 | Evaluation on the test database | `evaluate_test.py` | `data/test_evaluation/<model>_<fold>_<mode>/report.md` |
 
-### Filtering Scripts
-- `exploratory_analysis/filters.py`: Contains the filtering logic. The
-`apply_standard_filters` function applies:
-  - **ECG**: Notch filter at 50 Hz and a Butterworth bandpass filter (0
-.5–40 Hz).
-  - **PPG**: Butterworth bandpass filter (0.5–8 Hz).
-- `utils/filt_data_folder.py`: A utility to process entire database fol
-ders, apply the filters, and save the results as a new "filtered" datab
-ase in EDF format.
+Shared helpers: `utils/read_edf.py` (reads the ECG/PPG channels of an EDF
+file), `prototyping_dan/load_database.py` (reads the parquet database, patient
+IDs, CV groups).
 
-### How to run filtration
-Run the following command from the repository root:
+# Database filtering
+
+The raw database is filtered before anything else (power-line noise,
+baseline drift):
+- `exploratory_analysis/filters.py`: `apply_standard_filters` applies
+  - **ECG**: 50 Hz notch + Butterworth band-pass 0.5-40 Hz,
+  - **PPG**: Butterworth band-pass 0.5-8 Hz.
+- `utils/filt_data_folder.py`: filters a whole database folder and saves it
+  as the filtered database in EDF format (`filter_edf()` does one file; it is
+  reused by `predict.py`).
+
 ```bash
 uv run python utils/filt_data_folder.py data/harmonized_ecg_ppg_databases
 ```
-The results are saved to `data/harmonized_ecg_ppg_database_filtered/`.
-
-**Note:** To re-filter the data, delete the output folder or the `filte
-red_progress.csv` file first, as the script tracks progress to allow re
-suming interrupted runs.
-
-
-#
+The results are saved to `data/harmonized_ecg_ppg_database_filtered/`. To
+re-filter, delete the output folder or its `filtered_progress.csv` first
+(the script tracks progress to resume interrupted runs).
 
 # Pan-Tompkins HR and segment database (`databasing/pan_tompkins/`)
 
@@ -191,3 +198,166 @@ db = pd.read_parquet("data/hr_database_seg10s_step5s.parquet")
 usable = db[~db.is_flat & db.hr_valid]
 train = usable[usable.split == "train"]
 ```
+
+# Quality borders (`prototyping_dan/`)
+
+The model only gets segments whose signal metrics lie inside fixed borders.
+They were found from the errors of a model trained on all usable segments:
+
+1. `predict_training_segments.py`: predictions of each fold's model on its
+   training-database segments (`run_commands.py` runs all folds, then
+   `analyze_predictions.py` makes a per-fold report).
+2. `analyze_folds_combined.py`: for every metric, the border that rejects a
+   fixed share of segments where the error is largest
+   (`data/fold_analysis/combined_report/report.md`).
+3. The combined borders are stored in `FEASIBILITY_BOUNDS` in
+   `feasible_bpm.py` (strict `lower < value < upper`, NaN fails).
+   `PPG_BOUNDS` is the PPG part, the only one available at prediction time.
+4. Add the `feasible_bpm` column to the parquet files (after changing the
+   borders, run it again):
+   ```bash
+   uv run python prototyping_dan/feasible_bpm.py --parquet_dir data/hr_parts/seg10s_step5s
+   ```
+
+Helper plots: `plot_feasible_hist.py` (HR histogram of the feasible
+segments), `plot_hr_scatter.py` (reference vs predicted HR).
+
+# Training (`prototyping_dan/training.py`)
+
+```bash
+uv run python prototyping_dan/training.py --db_path data/hr_parts/seg10s_step5s --edf_dir data/harmonized_ecg_ppg_database_filtered --output_dir data/training_out_cnn --model dilated_cnn
+```
+
+- Data: train-split segments with a valid HR, not flat, and (default
+  `--target_col feasible_bpm`) inside the borders. The PPG is z-scored per
+  segment and kept in GPU memory.
+- CV: patient-wise `StratifiedGroupKFold` (5 folds); `--folds 1` trains only
+  fold 1.
+- Model: `dilated_cnn` (residual CNN with dilations 1-64, sees the whole
+  10 s window). The architecture and training choices are explained in
+  `prototyping_dan/architecture_and_training.md`.
+- Important options: `--epochs 15`, `--batch_size 512`, `--lr 1e-3`,
+  `--reweight sqrt_inv` (LDS weighting of rare HR ranges), `--patience 5`,
+  `--cache_dir` (cache of the loaded segments).
+- Output: `data/training_out_cnn/dilated_cnn/fold_<k>/best_model.pt`,
+  learning curves, `oof_predictions_dilated_cnn.csv`.
+
+# Prediction (`predict.py`)
+
+Input: one **raw** EDF recording (like `data/harmonized_ecg_ppg_databases`).
+Output: HR in bpm for every 10 s segment (step 5 s), or **NONE**, plus one HR
+for the whole recording (median of the feasible segments, or NONE).
+
+```bash
+uv run python predict.py data/harmonized_ecg_ppg_databases/wrist-finger-ppg/14_0.edf
+uv run python predict.py <file.edf> --model-path data/training_out_cnn/dilated_cnn/fold_2/best_model.pt --output preds.csv
+```
+
+Steps, each with the same code that made the training data:
+1. filtering with `filter_edf()` of `utils/filt_data_folder.py`, including
+   the EDF export (16-bit quantization; it changes e.g. `zero_dev_dur`),
+2. segments laid out like the database (start 0, 500, 1000, ... samples),
+3. metrics with `compute_segment_metrics` of `build_hr_database.py`,
+4. feasibility: not flat and inside the borders,
+   - `--feasibility ppg` (default): `PPG_BOUNDS`, needs only the PPG, as in
+     real use,
+   - `--feasibility full`: all borders (ECG + PPG), exactly the training
+     selection, needs the ECG channel,
+5. per-segment z-score -> model (default
+   `data/training_out_cnn/dilated_cnn/fold_1/best_model.pt`).
+
+Other options: `--input-filtered` (file is already from the filtered
+database), `--output` (CSV per segment with the metrics and the reason for
+NONE), `--device`. Checked: the metrics from the raw EDF are identical to the
+database values (difference 0) and the feasibility agrees 100 %.
+
+In code: `HRPredictor(model_path).predict_edf(path)` returns the segment
+table, `recording_hr(table)` the recording HR.
+
+# Test evaluation (`evaluate_test.py`)
+
+Runs `predict.py` on every test-split recording (raw EDF files) and compares
+it with the ECG reference HR on the test segments with a valid HR that are
+not flat (the same population as training).
+
+```bash
+uv run python evaluate_test.py
+uv run python evaluate_test.py --model-path data/training_out_cnn/dilated_cnn/fold_2/best_model.pt --feasibility full
+uv run python evaluate_test.py --limit-files 2 --output-dir data/test_evaluation/smoke   # quick test
+```
+
+Report (`data/test_evaluation/<model>_<fold>_<mode>/report.md`, plus
+`summary.json`, `segments.parquet`, figures):
+- **prediction**: coverage (share of test segments that get an HR), MAE,
+  RMSE, accuracy within ±5 bpm, bias, balanced MAE (mean over 10 bpm bins),
+- the model on all segments (no filter) and on the rejected ones, the
+  full-borders selection and the fold's CV result for comparison,
+- per dataset, per subject, per HR bin, the reasons for NONE, and the
+  pipeline check (recomputed metrics vs the database).
+
+Result of the current model (`fold_1`, PPG borders, 6 Nov 2026,
+`data/test_evaluation/dilated_cnn_fold_1_ppg/report.md`): HR for 66.5 % of
+the 171.7k test segments, MAE 4.71 bpm, RMSE 8.48 bpm, 72.6 % within ±5 bpm
+(no filter: MAE 5.86 bpm; full ECG + PPG borders: 31.8 % coverage, MAE
+3.99 bpm; CV fold 1: MAE 3.32 bpm).
+
+Options: `--workers 2` (RAM: ~1-2 GB per worker; recordings longer than
+`--big-file-samples` run one at a time), `--input-filtered` (faster, same
+signals), `--all-segments` (also the segments without a reference HR).
+
+# Other scripts
+
+Every script describes itself at the top of the file.
+
+| Script | Purpose |
+|---|---|
+| `databasing/evaluation_signal_segments.py` | `compute_metrics()` (the quality metrics, used by the database); run directly it writes the old 20 s evaluation table |
+| `databasing/pan_tompkins/plots.py` | presentation plots of the Pan-Tompkins HR (see above) |
+| `databasing/read_parquet.py` | prints a slice of a parquet file |
+| `exploratory_analysis/explore_plot.py` | interactive viewer of raw vs filtered signals with spectra (`time_frequency.py`) |
+| `exploratory_analysis/plot_signals_section.py`, `exclude_corupted_sections.py`, `analyze_corruption_stats.py` | old exploration based on the 20 s evaluation table |
+| `plot_single_edf.py` | raw vs filtered ECG/PPG of one file |
+| `prototyping_dan/predict_hr.py` | old version of `predict.py` (no filtering, older checkpoint paths) |
+| `prototyping_dan/train_signals_fisebility.py` | old version of `training.py` |
+| `prototyping_dan/commands.txt` | old command list for `predict_training_segments.py` |
+
+# Border sweep on Kaggle (status: **running**)
+
+Goal: find the borders in `FEASIBILITY_BOUNDS` with the best trade-off
+between HR accuracy and coverage. Only the borders change; data, model and
+training settings stay as in `training.py`. The plan is in
+`planning/cnn_borders_testing`.
+
+- `prototyping_dan/sweep_borders.py`: trains the model on CV fold 0 once per
+  border configuration and evaluates it on the same fixed validation
+  subjects. Levels are defined by coverage: a level `r` is the border that
+  alone rejects the share `r` of the training part
+  (`0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4`). Phases:
+  1. baselines (no filter, current borders) + one border at a time,
+  2. joint grid of the most important borders (at most 20 configurations),
+  3. extra seeds (43, 44) for no filter, current and the best
+     configurations.
+
+  Random-subset controls of the same size show whether a border helps by
+  picking better training data or only by making the validation set easier.
+  Every finished configuration is saved at once (`results/<hash>.json`), so
+  an interrupted run resumes.
+- `prototyping_dan/report_borders.py`: the report: risk-coverage curves, AURC
+  per variable, recommended `FEASIBILITY_BOUNDS` (highest validation
+  coverage with feasible MAE <= 5 bpm, better than its random control),
+  per-subject coverage, learning curves, seed spread.
+- `kaggle/`: `run_sweep.py` (kernel script; settings at the top),
+  `kernel-metadata.json`, `stage_code.py` (uploads the code as a dataset),
+  `README_kaggle.md` (all commands: upload, push, download, resume).
+
+Status (6 Nov 2026): kernel `dannguyen2/bsaa-border-sweep` (version 2) is
+**still running** on 2× T4, one configuration per GPU (about 1 min per epoch
+for the current borders, 2 min without a filter). Phase 1 alone takes about
+8-11 h, so the session (12 h limit, the sweep stops starting new
+configurations after 11 h) will probably end before the grid and the seeds;
+these then continue in a resumed session (`kaggle/README_kaggle.md`, section
+4). Results: `sweep_report.zip` / `sweep_results.zip` in the kernel output.
+
+When it is done: copy the recommended borders into `FEASIBILITY_BOUNDS`,
+re-run `feasible_bpm.py`, retrain (`training.py`) and evaluate with
+`evaluate_test.py`.

@@ -228,6 +228,7 @@ data
 planning
 side_scripts
 references\evaluation_results.parquet
+playground
 
 
 # macOS system files
@@ -235,3 +236,6 @@ references\evaluation_results.parquet
 
 # Local Claude Code instructions
 CLAUDE.md
+
+# Kaggle staging
+kaggle/_build

@@ -1,3 +1,16 @@
+"""
+HR per segment from the detected QRS peaks.
+
+- compute_hr_segments(): HR = 60 / mean RR per segment, with RR statistics
+  and invalid_reason (too_few_beats, hr_out_of_range, irregular_rr);
+  thresholds MIN_BEATS, HR_RANGE_BPM, MAX_RR_CV below.
+- mark_flat_segments() / ecg_flat_flags(): HR = NaN where the ECG is flat.
+- estimate_hr(): detection + HR + flat check in one call.
+
+Usage (one file, prints the segment table and the median HR):
+    python databasing/pan_tompkins/heart_rate.py <file.edf> [--segment-s 10] [--step-s 5]
+"""
+
 import argparse
 import sys
 from pathlib import Path
